@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve as resolvePath } from 'node:path'
 import { SettingsConflictError, type SettingsNamespace } from '@deepseek-ai/dsh-settings'
@@ -32,6 +32,8 @@ const canCreateSymlink = (() => {
 
 interface FakeContext {
   webRuntime: { trustedHosts: readonly string[] }
+  /** The host Connection admission check (tests admit everything). */
+  connection: { requestRejection: () => undefined }
   webServer: {
     register: (route: SidebarWebRoute) => () => void
     registerUpgrade: (route: SidebarWebUpgradeRoute) => () => void
@@ -60,6 +62,7 @@ describe('host plugin smoke', () => {
     const effects: Array<() => void | (() => void)> = []
     const ctx: FakeContext = {
       webRuntime: { trustedHosts: [] },
+      connection: { requestRejection: () => undefined },
       webServer: {
         register: (route) => { routes.push(route); return () => {} },
         registerUpgrade: (route) => { upgrades.push(route); return () => {} },
@@ -102,6 +105,7 @@ describe('host plugin smoke', () => {
     const effects: Array<() => void | (() => void)> = []
     const ctx: FakeContext = {
       webRuntime: { trustedHosts: [] },
+      connection: { requestRejection: () => undefined },
       webServer: {
         register: (route) => { routes.push(route); return () => {} },
         registerUpgrade: () => () => {},
@@ -312,6 +316,7 @@ describe('session cwd resolution over the API route', () => {
     const routes: SidebarWebRoute[] = []
     const ctx = {
       webRuntime: { trustedHosts: [] },
+      connection: { requestRejection: () => undefined },
       webServer: {
         register: (route: SidebarWebRoute) => { routes.push(route); return () => {} },
         registerUpgrade: (route: SidebarWebUpgradeRoute) => { void route; return () => {} },
@@ -365,20 +370,19 @@ describe('session cwd resolution over the API route', () => {
     return out
   }
 
-  it('uses the client summary cwd while the session is detached', async () => {
+  it('refuses an unknown session even when the client supplies a cwd (404)', async () => {
     const route = mount()
     const result = await invoke(route, 'session.cwd', { sessionId: 's-detached', cwd: '/tmp/summary-cwd' })
-    expect(result.ok).toBe(true)
-    // The summary cwd passes through requireAbsolute (platform resolve), so
-    // the expectation follows the platform's own normalization.
-    expect(result.value?.cwd).toBe(resolvePath('/tmp/summary-cwd'))
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe(404)
+    expect(result.error?.code).toBe('not-found')
   })
 
-  it('falls back to the process cwd with no summary cwd', async () => {
+  it('refuses an unknown session instead of falling back to the process cwd (404)', async () => {
     const route = mount()
     const result = await invoke(route, 'session.cwd', { sessionId: 's-unknown' })
-    expect(result.ok).toBe(true)
-    expect(result.value?.cwd).toBe(process.cwd())
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe(404)
   })
 
   it('resolves a cold (detached) session cwd through the persistence index', async () => {
@@ -417,15 +421,26 @@ describe('session cwd resolution over the API route', () => {
     expect(result.error?.message).toMatch(/invalid working directory/)
   })
 
-  it('falls back to the process cwd when persistence has no cwd for the session', async () => {
+  it('refuses a session persistence has no cwd for (404)', async () => {
     const route = mount({
       sessionPersistence: {
         open: async () => ({ header: {}, read: async () => ({ events: [] }), close: async () => {} }),
       },
     })
     const result = await invoke(route, 'session.cwd', { sessionId: 's-blank' })
-    expect(result.ok).toBe(true)
-    expect(result.value?.cwd).toBe(process.cwd())
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe(404)
+  })
+
+  it('refuses a session persistence does not know (404)', async () => {
+    const route = mount({
+      sessionPersistence: {
+        open: async () => { throw new Error('ENOENT: no such session') },
+      },
+    })
+    const result = await invoke(route, 'fs.read', { sessionId: 's-missing', cwd: '/', path: '/etc/hostname' })
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe(404)
   })
 
   it('prefers the attached session header over the client summary', async () => {
@@ -437,13 +452,6 @@ describe('session cwd resolution over the API route', () => {
     const result = await invoke(route, 'session.cwd', { sessionId: 's-attached', cwd: '/tmp/summary-cwd' })
     expect(result.ok).toBe(true)
     expect(result.value?.cwd).toBe('/attached-cwd')
-  })
-
-  it('rejects a non-absolute client cwd', async () => {
-    const route = mount()
-    const result = await invoke(route, 'session.cwd', { sessionId: 's-detached', cwd: 'relative/path' })
-    expect(result.ok).toBe(false)
-    expect(result.error?.message).toMatch(/invalid working directory/)
   })
 
   it('git.diff resolves repo-relative paths (session in a subdirectory)', async () => {
@@ -475,20 +483,19 @@ describe('session cwd resolution over the API route', () => {
     expect(value.value?.content).toContain('runGit')
   })
 
-  it('reads repo-root-relative paths outside a nested session workspace (fence removed)', async () => {
+  it('refuses repo-root-relative paths outside a nested session workspace (403)', async () => {
     const route = mount({
       sessions: {
         get: () => ({ header: { cwd: join(process.cwd(), 'src') } }),
       },
     })
-    // ⚠️ PERMISSION CHANGE: `package.json` sits ABOVE the nested session cwd.
-    // The containment guard is gone, so this now reads like any other path.
+    // `package.json` sits ABOVE the nested session cwd: outside the workspace.
     const result = await invoke(route, 'fs.read', { sessionId: 's-sub', path: 'package.json' })
-    expect(result.ok).toBe(true)
-    expect((result.value as { content?: string } | undefined)?.content).toContain('"name"')
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe(403)
   })
 
-  it('lists a directory outside the session workspace (fence removed)', async () => {
+  it('refuses listing a directory outside the session workspace (403)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'dsh-sidebar-fs-security-'))
     const workspace = join(root, 'workspace')
     const outside = join(root, 'outside')
@@ -499,16 +506,14 @@ describe('session cwd resolution over the API route', () => {
     try {
       const route = mount({ sessions: { get: () => ({ header: { cwd: workspace } }) } })
       const tree = await invoke(route, 'fs.tree', { sessionId: 'security', path: outside })
-      expect(tree.ok).toBe(true)
-      const value = tree.value as unknown as { path: string; entries: Array<{ name: string }> }
-      expect(value.path).toBe(outside)
-      expect(value.entries.map(entry => entry.name)).toEqual(['secret.txt'])
+      expect(tree.ok).toBe(false)
+      expect(tree.status).toBe(403)
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
   })
 
-  it('reads a file outside the session workspace (fence removed)', async () => {
+  it('refuses reading a file outside the session workspace (403)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'dsh-sidebar-fs-security-'))
     const workspace = join(root, 'workspace')
     const outside = join(root, 'outside')
@@ -519,14 +524,14 @@ describe('session cwd resolution over the API route', () => {
     try {
       const route = mount({ sessions: { get: () => ({ header: { cwd: workspace } }) } })
       const read = await invoke(route, 'fs.read', { sessionId: 'security', path: outsideFile })
-      expect(read.ok).toBe(true)
-      expect((read.value as unknown as { kind: string; content: string }).content).toBe('secret')
+      expect(read.ok).toBe(false)
+      expect(read.status).toBe(403)
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
   })
 
-  it('writes a file outside the session workspace (fence removed)', async () => {
+  it('refuses writing a file outside the session workspace (403)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'dsh-sidebar-fs-security-'))
     const workspace = join(root, 'workspace')
     const outside = join(root, 'outside')
@@ -536,14 +541,15 @@ describe('session cwd resolution over the API route', () => {
     try {
       const route = mount({ sessions: { get: () => ({ header: { cwd: workspace } }) } })
       const write = await invoke(route, 'fs.write', { sessionId: 'security', path: written, content: 'hack' })
-      expect(write.ok).toBe(true)
-      expect(readFileSync(written, 'utf8')).toBe('hack')
+      expect(write.ok).toBe(false)
+      expect(write.status).toBe(403)
+      expect(existsSync(written)).toBe(false)
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
   })
 
-  it('serves media and HTML through a workspace symlink (fence removed)', async () => {
+  it('refuses media and HTML through a workspace symlink that leaves the workspace (403)', async () => {
     if (!canCreateSymlink) return
     const root = mkdtempSync(join(tmpdir(), 'dsh-sidebar-route-symlink-security-'))
     const workspace = join(root, 'workspace')
@@ -566,9 +572,9 @@ describe('session cwd resolution over the API route', () => {
       // platform (a Windows drive path needs the leading slash separator
       // that a naive join-without-separator drops).
       const htmlResult = await invokeGet(html, encodeHtmlUrl('security', join(workspace, 'link', 'page.html')))
-      expect(mediaResult).toMatchObject({ status: 200 })
-      expect(htmlResult).toMatchObject({ status: 200 })
-      expect(htmlResult.body).toContain('outside')
+      expect(mediaResult).toMatchObject({ status: 403 })
+      expect(htmlResult).toMatchObject({ status: 403 })
+      expect(htmlResult.body).not.toContain('<p>outside</p>')
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
@@ -656,7 +662,7 @@ describe('session cwd resolution over the API route', () => {
     }
   })
 
-  it.skipIf(!canCreateSymlink)('lists a workspace symlink that resolves outside the workspace', async () => {
+  it.skipIf(!canCreateSymlink)('refuses listing a workspace symlink that resolves outside the workspace (403)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'dsh-sidebar-fs-symlink-security-'))
     const workspace = join(root, 'workspace')
     const outside = join(root, 'outside')
@@ -666,16 +672,16 @@ describe('session cwd resolution over the API route', () => {
     try {
       symlinkSync(outside, join(workspace, 'link'))
       const route = mount({ sessions: { get: () => ({ header: { cwd: workspace } }) } })
-      // No realpath: the link is followed like any other directory.
+      // realpath: the link's target is outside the workspace.
       const tree = await invoke(route, 'fs.tree', { sessionId: 'security', path: join(workspace, 'link') })
-      expect(tree.ok).toBe(true)
-      expect((tree.value as unknown as { entries: Array<{ name: string }> }).entries.map(entry => entry.name)).toEqual(['secret.txt'])
+      expect(tree.ok).toBe(false)
+      expect(tree.status).toBe(403)
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
   })
 
-  it.skipIf(!canCreateSymlink)('reads through a workspace symlink', async () => {
+  it.skipIf(!canCreateSymlink)('refuses reading through a workspace symlink that leaves the workspace (403)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'dsh-sidebar-fs-symlink-security-'))
     const workspace = join(root, 'workspace')
     const outside = join(root, 'outside')
@@ -686,14 +692,14 @@ describe('session cwd resolution over the API route', () => {
       symlinkSync(outside, join(workspace, 'link'))
       const route = mount({ sessions: { get: () => ({ header: { cwd: workspace } }) } })
       const read = await invoke(route, 'fs.read', { sessionId: 'security', path: join(workspace, 'link', 'secret.txt') })
-      expect(read.ok).toBe(true)
-      expect((read.value as unknown as { content: string }).content).toBe('secret')
+      expect(read.ok).toBe(false)
+      expect(read.status).toBe(403)
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
   })
 
-  it.skipIf(!canCreateSymlink)('writes through a workspace symlink', async () => {
+  it.skipIf(!canCreateSymlink)('refuses writing through a workspace symlink that leaves the workspace (403)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'dsh-sidebar-fs-symlink-security-'))
     const workspace = join(root, 'workspace')
     const outside = join(root, 'outside')
@@ -703,9 +709,9 @@ describe('session cwd resolution over the API route', () => {
       symlinkSync(outside, join(workspace, 'link'))
       const route = mount({ sessions: { get: () => ({ header: { cwd: workspace } }) } })
       const write = await invoke(route, 'fs.write', { sessionId: 'security', path: join(workspace, 'link', 'new.txt'), content: 'hack' })
-      expect(write.ok).toBe(true)
-      // The write landed on the link's TARGET (the link is not replaced).
-      expect(readFileSync(join(outside, 'new.txt'), 'utf8')).toBe('hack')
+      expect(write.ok).toBe(false)
+      expect(write.status).toBe(403)
+      expect(existsSync(join(outside, 'new.txt'))).toBe(false)
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
@@ -788,15 +794,16 @@ const createFakeSettings = (pre?: Record<string, Record<string, unknown>>) => {
  * @param home - a harness home holding a retired `settings.yaml`, when the test wants the legacy import to run.
  * @returns the mounted `/sidebar/api` route.
  */
-const mountWithSettings = (settings?: unknown, home?: string): SidebarWebRoute => {
+const mountWithSettings = (settings?: unknown, home?: string, sessionCwd?: string): SidebarWebRoute => {
   const routes: SidebarWebRoute[] = []
   const ctx = {
     webRuntime: { trustedHosts: [] },
+    connection: { requestRejection: () => undefined },
     webServer: {
       register: (route: SidebarWebRoute) => { routes.push(route); return () => {} },
       registerUpgrade: (route: SidebarWebUpgradeRoute) => { void route; return () => {} },
     },
-    sessions: { get: () => undefined },
+    sessions: { get: () => (sessionCwd === undefined ? undefined : { header: { cwd: sessionCwd } }) },
     tools: { register: () => () => {} },
     effect: (fn: () => void | (() => void)) => { fn() },
     inject: (deps: string[], callback: (sctx: { settings: unknown }) => void) => {
@@ -949,32 +956,25 @@ describe('side card settings routes', () => {
     }
   })
 
-  it('reaches outside the workspace with no pref set (the fence is gone)', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'dsh-sidebar-fence-off-'))
+  it('keeps containment whatever the legacy workspaceFence pref says', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-sidebar-fence-legacy-'))
     const workspace = join(root, 'workspace')
     const outside = join(root, 'outside')
     mkdirSync(workspace)
     mkdirSync(outside)
     writeFileSync(join(outside, 'secret.txt'), 'global instructions')
     try {
-      // ⚠️ PERMISSION CHANGE: the default is now "no containment", and there
-      // is no switch to arm it — the routes read/write wherever the host user
-      // can. (`workspaceFence` in an old profile is simply an unknown key.)
-      const route = mountWithSettings(createFakeSettings())
-      const read = await invoke(route, 'fs.read', { sessionId: 'fence', cwd: workspace, path: join(outside, 'secret.txt') })
-      expect(read).toMatchObject({ ok: true, value: { kind: 'text', content: 'global instructions' } })
-      const tree = await invoke(route, 'fs.tree', { sessionId: 'fence', cwd: workspace, path: outside })
-      expect(tree).toMatchObject({ ok: true })
-      const write = await invoke(route, 'fs.write', { sessionId: 'fence', cwd: workspace, path: join(outside, 'written.txt'), content: 'ok' })
-      expect(write).toMatchObject({ ok: true })
-      expect(readFileSync(join(outside, 'written.txt'), 'utf8')).toBe('ok')
-      // A legacy `workspaceFence: true` patch is just an unknown prefs key now
-      // (the schema no longer declares it): it must not fail the write and must
-      // not re-arm anything.
-      const legacy = await invoke(route, 'settings.update', { patch: { workspaceFence: true } })
+      // Containment has no switch: a legacy `workspaceFence: false` patch is
+      // just an unknown prefs key (the schema no longer declares it). It must
+      // not fail the write and must not disarm anything.
+      const route = mountWithSettings(createFakeSettings(), undefined, workspace)
+      const legacy = await invoke(route, 'settings.update', { patch: { workspaceFence: false } })
       expect(legacy.ok).toBe(true)
-      const stillOpen = await invoke(route, 'fs.read', { sessionId: 'fence', cwd: workspace, path: join(outside, 'secret.txt') })
-      expect(stillOpen).toMatchObject({ ok: true })
+      const read = await invoke(route, 'fs.read', { sessionId: 'fence', path: join(outside, 'secret.txt') })
+      expect(read).toMatchObject({ ok: false, error: { code: 'forbidden' } })
+      const write = await invoke(route, 'fs.write', { sessionId: 'fence', path: join(outside, 'written.txt'), content: 'ok' })
+      expect(write).toMatchObject({ ok: false, error: { code: 'forbidden' } })
+      expect(existsSync(join(outside, 'written.txt'))).toBe(false)
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
@@ -1023,6 +1023,7 @@ describe('agent sidebar-open tool gating', () => {
     }
     const ctx = {
       webRuntime: { trustedHosts: [] },
+      connection: { requestRejection: () => undefined },
       webServer: {
         register: (route: SidebarWebRoute) => { routes.push(route); return () => {} },
         registerUpgrade: (route: SidebarWebUpgradeRoute) => { void route; return () => {} },

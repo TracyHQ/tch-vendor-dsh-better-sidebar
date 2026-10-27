@@ -106,16 +106,23 @@ function readZip(archive: Buffer): ParsedEntry[] {
   return entries
 }
 
+/**
+ * The fake host session store: a test's `cwd` is registered here as the
+ * session's server-side record (the routes never read a client cwd).
+ */
+const sessionCwds = new Map<string, string>()
+
 /** The host mounted against a fake context: both archive routes + the API. */
 function mountHost(): { api: SidebarWebRoute; download: SidebarWebRoute } {
   const routes: SidebarWebRoute[] = []
   const ctx = {
     webRuntime: { trustedHosts: [] },
+    connection: { requestRejection: () => undefined },
     webServer: {
       register: (route: SidebarWebRoute) => { routes.push(route); return () => {} },
       registerUpgrade: (route: SidebarWebUpgradeRoute) => { void route; return () => {} },
     },
-    sessions: { get: () => undefined },
+    sessions: { get: (id: string) => (sessionCwds.has(id) ? { header: { cwd: sessionCwds.get(id) } } : undefined) },
     tools: { register: () => () => {} },
     effect: (fn: () => void | (() => void)) => { fn() },
     inject: () => () => {},
@@ -136,6 +143,8 @@ async function post(
   method: string,
   payload: unknown,
 ): Promise<{ status: number; ok: boolean; value?: unknown; error?: { code?: string; message?: string } }> {
+  const record = payload as { sessionId?: unknown; cwd?: unknown }
+  if (typeof record.sessionId === 'string' && typeof record.cwd === 'string') sessionCwds.set(record.sessionId, record.cwd)
   const body = Buffer.from(JSON.stringify(payload))
   const req = {
     method: 'POST',
@@ -836,24 +845,17 @@ describe('archive task flow (build → status → download)', () => {
     expect(byName.get('b/index.ts')!.data.toString('utf8')).toBe('from b\n')
   })
 
-  it('zips a path outside the session workspace (fence removed)', async () => {
+  it('refuses to zip a path outside the session workspace (403)', async () => {
     const root = tempRoot()
     const workspace = join(root, 'workspace')
     const outside = join(root, 'outside')
     mkdirSync(workspace)
     mkdirSync(outside)
     writeFileSync(join(outside, 'secret.txt'), 'secret')
-    const { download } = await archiveFlow({
-      sessionId: 's-zip',
-      cwd: workspace,
-      paths: [join(outside, 'secret.txt')],
-    })
-    // ⚠️ PERMISSION CHANGE: an absolute path outside the workspace is now a
-    // normal selection (no 403 branch exists any more).
-    expect(download.status).toBe(200)
-    const entries = readZip(download.body)
-    expect(entries.map(entry => entry.name)).toEqual(['secret.txt'])
-    expect(entries[0]!.data.toString('utf8')).toBe('secret')
+    const { api } = mountHost()
+    const build = await post(api, 'archive.build', { sessionId: 's-zip', cwd: workspace, paths: [join(outside, 'secret.txt')] })
+    expect(build.status).toBe(403)
+    expect(build.error?.code).toBe('forbidden')
   })
 
   it('skips a symlink row while walking a directory (no escape by following)', async () => {

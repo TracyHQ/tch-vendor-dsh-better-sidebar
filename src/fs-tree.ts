@@ -225,10 +225,8 @@ export function requireAbsolute(path: string): string {
  * style and — on Windows, where the filesystem is case-insensitive — of
  * letter case.
  *
- * LEXICAL ONLY, and no longer a security boundary: the sidebar's containment
- * fence was removed (see path-security.ts), so nothing in this plugin decides
- * access by this function any more. It is kept for the client-side mirror
- * usage and the historical tests, not as a guard.
+ * Lexical by itself: path-security.ts calls it on REALPATH-canonicalized
+ * paths, which is what makes it the workspace containment check.
  * @param platform - filesystem semantics; injectable so both branches are
  *  unit-testable on any host.
  */

@@ -2,9 +2,9 @@
  * File mutations for the sidebar (the upload route and the tree's renames,
  * deletes and mkdirs).
  *
- * ⚠️ **No workspace containment any more.** The guard was removed at the
- * user's request, so these operations reach whatever the HOST USER can reach.
- * What is still enforced is the SHAPE of a request: the relative upload path
+ * Every target is confined to the session workspace through path-security.ts
+ * (realpath-based, 403 outside). On top of that the SHAPE of a request is
+ * enforced: the relative upload path
  * is sanitized (absolute paths, '.', '..' and empty segments are refused), a
  * rename/mkdir name must be one path segment, an existing destination is
  * refused instead of clobbered, and the session workspace root itself is never
@@ -24,8 +24,7 @@ import { createWriteStream } from 'node:fs'
 import { access, lstat, mkdir, rename, rm, stat, unlink } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { invalidateDirectoryCache, requireAbsolute } from './fs-tree.ts'
-import { ensureWorkspacePath, ensureWorkspaceWritePath } from './path-security.ts'
-import { resolveSessionPath } from './session-path.ts'
+import { ensureWorkspaceEntry, ensureWorkspacePath, ensureWorkspaceWritePath } from './path-security.ts'
 import { SidebarError } from './wire.ts'
 
 /** Inputs of one upload: the session scope plus the request body stream. */
@@ -40,8 +39,6 @@ export interface WorkspaceUploadInput {
   chunks: AsyncIterable<string | Uint8Array>
   /** Byte cap; an oversized upload is refused without touching the target. */
   limit: number
-  /** @deprecated IGNORED — containment was removed. Do not pass it. */
-  fence?: boolean
 }
 
 /**
@@ -114,23 +111,20 @@ export interface WorkspaceRenameInput {
   path: string
   /** The new base name (single segment — rename never moves across directories). */
   name: string
-  /** @deprecated IGNORED — containment was removed. Do not pass it. */
-  fence?: boolean
 }
 
 /**
- * Resolve one existing entry for a link-aware mutation: the lexical row path
- * plus the resolved workspace root (for the "never rename/remove the root"
- * check). No realpath, no containment: the path exists (lstat decides) and the
- * operation addresses it as written.
+ * Resolve one existing entry for a link-aware mutation: the canonical row
+ * path (parent through realpath, last segment as written so a symlink row
+ * addresses the link) plus the canonical workspace root (for the "never
+ * rename/remove the root" check). Refuses a row outside the workspace.
  */
 async function resolveEntry(
   cwd: string,
   target: string,
 ): Promise<{ absolute: string; real: string; realCwd: string }> {
-  const absolute = requireAbsolute(resolveSessionPath(cwd, target))
-  const realCwd = requireAbsolute(cwd)
-  return { absolute, real: absolute, realCwd }
+  const { entry, realCwd } = await ensureWorkspaceEntry(cwd, target)
+  return { absolute: entry, real: entry, realCwd }
 }
 
 /** Whether a path exists (ENOENT → false; other failures propagate). */
@@ -187,8 +181,6 @@ export interface WorkspaceMkdirInput {
   path: string
   /** The new directory's base name (single segment — mkdir never nests). */
   name: string
-  /** @deprecated IGNORED — containment was removed. Do not pass it. */
-  fence?: boolean
 }
 
 /**
@@ -226,8 +218,6 @@ export interface WorkspaceRemoveInput {
   cwd: string
   /** Absolute path of the row as the tree displays it (may be a symlink). */
   path: string
-  /** @deprecated IGNORED — containment was removed. Do not pass it. */
-  fence?: boolean
 }
 
 /**

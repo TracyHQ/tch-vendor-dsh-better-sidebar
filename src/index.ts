@@ -7,13 +7,16 @@
  * web runtime's `trustedHosts` (LAN IP literals sampled at boot plus
  * `--trusted-host` authorities), read per request from the live service
  * value so the fence tracks the same trust source the /api gateway derives
- * its list from.
+ * its list from — AND the host Connection's authenticated admission check
+ * (`ctx.connection.requestRejection`: launch-token signed cookie).
  *
  * All operations are conversation-scoped: requests carry a sessionId and the
- * session's authoritative cwd comes from the session store.
+ * session's authoritative cwd comes from the session store (never from the
+ * request); unknown sessions are refused, and every filesystem target is
+ * confined to that workspace (path-security.ts).
  */
 import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { basename, dirname, extname, isAbsolute, join, sep } from 'node:path'
+import { basename, dirname, extname, isAbsolute, join, posix, sep } from 'node:path'
 import type { IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { WebSocket, WebSocketServer } from 'ws'
@@ -87,8 +90,8 @@ export interface SidebarFsLevel {
   error?: string
 }
 
-/** Services required before mounting: the webserver routes, the session store, the web runtime's trusted hosts, and the tool registry. */
-export const inject = ['webServer', 'sessions', 'webRuntime', 'tools']
+/** Services required before mounting: the webserver routes, the session store, the web runtime's trusted hosts, the tool registry, and the host Connection (authenticated route admission). */
+export const inject = ['webServer', 'sessions', 'webRuntime', 'tools', 'connection']
 
 /** Content types for the media route, by extension. */
 const MEDIA_TYPES: Record<string, string> = {
@@ -112,35 +115,25 @@ export function mediaTypeForPath(path: string): string {
 }
 
 /**
- * Resolve a session's authoritative working directory. The attached session
- * header wins; while the session is still hydrating from persistence (the
- * web client attaches the current conversation a moment after page load, so
- * the very first sidebar requests can arrive detached) the caller's own
- * list-summary cwd is used; the session-persistence index is queried as a
- * last resort for cold (not-yet-attached) sessions so a detached first
- * request still resolves the correct project instead of the host process
- * cwd (which on Windows is the DSH source root after `dsh.cmd`'s `pushd`,
- * causing every user-project path to be misclassified as "outside
- * workspace"). The host process cwd is the FINAL fallback for deployments
- * without persistence (tests / stripped-down hosts); production always
- * provides persistence, so the bug-fix path (header → client → persistence)
- * always resolves the real session cwd before reaching it.
+ * Resolve a session's authoritative working directory from the server's own
+ * record: the attached session's header, or — for a cold (not-yet-attached)
+ * session, e.g. the first sidebar requests right after page load — the
+ * session-persistence index. A caller-supplied cwd is never consulted, and a
+ * session the host does not know is refused: the cwd is the containment root
+ * of every filesystem route (see path-security.ts).
  */
-async function sessionCwdOf(ctx: Context, sessionId: string, clientCwd?: string): Promise<string> {
+async function sessionCwdOf(ctx: Context, sessionId: string): Promise<string> {
   const session = ctx.sessions.get(sessionId)
   const headerCwd = session?.header.cwd
   if (headerCwd !== undefined && headerCwd !== '') return headerCwd
-  if (clientCwd !== undefined && clientCwd !== '') {
-    try {
-      return requireAbsolute(clientCwd)
-    } catch {
-      throw new SidebarError('bad-request', `invalid working directory "${clientCwd}"`)
-    }
-  }
   const persistence = ctx.get('sessionPersistence')
   if (persistence !== undefined) {
-    const persisted = await readPersistedSession(persistence, sessionId)
-    const metaCwd = persisted.header.cwd
+    let metaCwd: string | undefined
+    try {
+      metaCwd = (await readPersistedSession(persistence, sessionId)).header.cwd
+    } catch {
+      metaCwd = undefined
+    }
     if (metaCwd !== undefined && metaCwd !== '') {
       try {
         return requireAbsolute(metaCwd)
@@ -149,7 +142,7 @@ async function sessionCwdOf(ctx: Context, sessionId: string, clientCwd?: string)
       }
     }
   }
-  return process.cwd()
+  throw new SidebarError('not-found', `unknown session "${sessionId}"`, 404)
 }
 
 /** Optional repository selected by the Git panel when cwd is a container. */
@@ -176,6 +169,34 @@ async function resolveGitPath(cwd: string, raw: string, selected?: string): Prom
   if (await stat(sessionPath).then(() => true).catch(() => false)) return sessionPath
   const root = await git.repoRoot(cwd, selected).catch(() => cwd)
   return requireAbsolute(join(root, raw))
+}
+
+/**
+ * Resolve a git-route path (absolute, session-relative, or repository-root-
+ * relative as git status reports it) and confine it to the session workspace.
+ * Uses the write-path check (realpath of the nearest existing ancestor)
+ * because a git path may name a file deleted from the worktree.
+ * @returns the canonical absolute path to hand to git.
+ * @throws SidebarError `forbidden` (403) outside the workspace.
+ */
+async function containedGitPath(cwd: string, raw: string, selected?: string): Promise<string> {
+  return ensureWorkspaceWritePath(cwd, await resolveGitPath(cwd, raw, selected))
+}
+
+/**
+ * Confine a revision-tree path (`git show <rev>:<path>`, repository-relative)
+ * to the session workspace: the path is normalized, must stay below the
+ * repository root, and its worktree location must lie inside the workspace.
+ * @returns the normalized repository-relative path to hand to git.
+ */
+async function containedRevisionPath(cwd: string, raw: string, selected?: string): Promise<string> {
+  const normalized = posix.normalize(raw.replace(/\\/g, '/'))
+  if (normalized === '..' || normalized.startsWith('../') || posix.isAbsolute(normalized) || isAbsolute(raw)) {
+    throw new SidebarError('forbidden', `path "${raw}" is outside workspace`, 403)
+  }
+  const root = await git.repoRoot(cwd, selected)
+  await ensureWorkspaceWritePath(cwd, requireAbsolute(join(root, normalized)))
+  return normalized
 }
 
 /** How many leading bytes a binary read returns for client-side detect sniffing. */
@@ -256,9 +277,7 @@ function buildApi(
 ): Record<string, ApiMethod> {
   const cwdOf = async (payload: unknown): Promise<{ sessionId: string; cwd: string }> => {
     const sessionId = requireString(payload, 'sessionId')
-    const record = payload as { cwd?: unknown } | null
-    const clientCwd = typeof record?.cwd === 'string' && record.cwd !== '' ? record.cwd : undefined
-    return { sessionId, cwd: await sessionCwdOf(ctx, sessionId, clientCwd) }
+    return { sessionId, cwd: await sessionCwdOf(ctx, sessionId) }
   }
   /** Resolve the optional Git-panel checkout selector against the authoritative
    * session repository. Unlike `cwd`, `worktree` is never trusted directly. */
@@ -406,21 +425,23 @@ function buildApi(
       const { cwd } = await gitCwdOf(payload)
       const record = payload as { path?: unknown; staged?: unknown }
       const repoRoot = selectedRepoOf(payload)
-      const path = record.path === undefined ? undefined : await resolveGitPath(cwd, requireString(payload, 'path'), repoRoot)
+      const path = record.path === undefined ? undefined : await containedGitPath(cwd, requireString(payload, 'path'), repoRoot)
       return { diff: await git.diff(cwd, path, record.staged === true, repoRoot) }
     },
     'git.stage': async (payload) => {
       const { cwd } = await gitCwdOf(payload)
       const record = payload as { path?: unknown }
-      const path = record.path === undefined ? undefined : requireString(payload, 'path')
-      await git.stage(cwd, path, selectedRepoOf(payload))
+      const repoRoot = selectedRepoOf(payload)
+      const path = record.path === undefined ? undefined : await containedGitPath(cwd, requireString(payload, 'path'), repoRoot)
+      await git.stage(cwd, path, repoRoot)
       return { ok: true }
     },
     'git.unstage': async (payload) => {
       const { cwd } = await gitCwdOf(payload)
       const record = payload as { path?: unknown }
-      const path = record.path === undefined ? undefined : requireString(payload, 'path')
-      await git.unstage(cwd, path, selectedRepoOf(payload))
+      const repoRoot = selectedRepoOf(payload)
+      const path = record.path === undefined ? undefined : await containedGitPath(cwd, requireString(payload, 'path'), repoRoot)
+      await git.unstage(cwd, path, repoRoot)
       return { ok: true }
     },
     'git.commit': async (payload) => {
@@ -456,7 +477,7 @@ function buildApi(
     'git.discard': async (payload) => {
       const { cwd } = await gitCwdOf(payload)
       const repoRoot = selectedRepoOf(payload)
-      await git.discard(cwd, await resolveGitPath(cwd, requireString(payload, 'path'), repoRoot), repoRoot)
+      await git.discard(cwd, await containedGitPath(cwd, requireString(payload, 'path'), repoRoot), repoRoot)
       return { ok: true }
     },
     'git.revert': async (payload) => {
@@ -477,8 +498,9 @@ function buildApi(
       // the a// b/ prefix). The absolute filesystem paths resolveGitPath
       // produces would break the rev:path syntax and fail every read, so the
       // path passes through as-is — it can only address blobs of this repo's
-      // own revisions, the same surface git.diff/git.log already expose.
-      const path = requireString(payload, 'path')
+      // own revisions. It is still confined: its worktree location must lie
+      // inside the session workspace (containedRevisionPath).
+      const path = await containedRevisionPath(cwd, requireString(payload, 'path'), repoRoot)
       const rev = requireString(payload, 'rev')
       return { content: await git.show(cwd, rev, path, repoRoot) }
     },
@@ -764,7 +786,18 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
   // plus --trusted-host authorities) — the authoritative source the /api
   // gateway fence derives its list from. Read per request from the live
   // service value; a replaced list takes effect without a plugin restart.
-  const fence = (req: SidebarHttpRequest): boolean => isTrustedApiRequest(req, ctx.webRuntime.trustedHosts)
+  // Admission for every /sidebar HTTP and WebSocket route: the plugin's own
+  // Host/Origin fence (kept as an extra layer), then the host Connection's
+  // authenticated check — the same Host/Origin rules plus the launch-token
+  // signed browser cookie the /api gateway requires. Fails closed (401) when
+  // the host provides no such check.
+  const rejectionOf = (req: SidebarHttpRequest): 401 | 403 | undefined => {
+    if (!isTrustedApiRequest(req, ctx.webRuntime.trustedHosts)) return 403
+    const connection = ctx.connection
+    if (connection?.requestRejection === undefined) return 401
+    return connection.requestRejection(req)
+  }
+  const fence = (req: SidebarHttpRequest): boolean => rejectionOf(req) === undefined
   // The model-facing open-request registry: queues `sidebar_open` requests
   // per session and pushes them to connected sidebar views over the
   // `/sidebar/ws/agent-opens` socket.
@@ -896,8 +929,9 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
     kind: 'prefix',
     path: '/sidebar/api',
     handler: async (req, res) => {
-      if (!fence(req)) {
-        writeJson(res, 403, { ok: false, error: { code: 'forbidden', message: 'forbidden' } })
+      const rejection = rejectionOf(req)
+      if (rejection !== undefined) {
+        writeJson(res, rejection, { ok: false, error: { code: 'forbidden', message: 'forbidden' } })
         return
       }
       if (req.method !== 'POST') {
@@ -933,8 +967,9 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
     kind: 'exact',
     path: '/sidebar/upload',
     handler: async (req, res) => {
-      if (!fence(req)) {
-        writeJson(res, 403, { ok: false, error: { code: 'forbidden', message: 'forbidden' } })
+      const rejection = rejectionOf(req)
+      if (rejection !== undefined) {
+        writeJson(res, rejection, { ok: false, error: { code: 'forbidden', message: 'forbidden' } })
         return
       }
       if (req.method !== 'POST') {
@@ -949,7 +984,7 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
         if (sessionId === null || dir === null || relativePath === null || relativePath.trim() === '') {
           throw new SidebarError('bad-request', 'sessionId, dir, and relativePath are required')
         }
-        const cwd = await sessionCwdOf(ctx, sessionId, url.searchParams.get('cwd') ?? undefined)
+        const cwd = await sessionCwdOf(ctx, sessionId)
         const { path, size } = await writeWorkspaceUpload({
           cwd,
           dir,
@@ -982,8 +1017,9 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
     kind: 'exact',
     path: '/sidebar/archive',
     handler: async (req, res) => {
-      if (!fence(req)) {
-        writeJson(res, 403, { ok: false, error: { code: 'forbidden', message: 'forbidden' } })
+      const rejection = rejectionOf(req)
+      if (rejection !== undefined) {
+        writeJson(res, rejection, { ok: false, error: { code: 'forbidden', message: 'forbidden' } })
         return
       }
       if (req.method !== 'GET') {
@@ -1007,8 +1043,9 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
     kind: 'prefix',
     path: '/sidebar/file',
     handler: async (req, res) => {
-      if (!fence(req)) {
-        res.writeHead(403)
+      const rejection = rejectionOf(req)
+      if (rejection !== undefined) {
+        res.writeHead(rejection)
         res.end('forbidden')
         return
       }
@@ -1022,7 +1059,7 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
         const sessionId = url.searchParams.get('sessionId')
         const raw = url.searchParams.get('path')
         if (sessionId === null || raw === null) throw new SidebarError('bad-request', 'sessionId and path are required')
-        const cwd = await sessionCwdOf(ctx, sessionId, url.searchParams.get('cwd') ?? undefined)
+        const cwd = await sessionCwdOf(ctx, sessionId)
         const path = await ensureWorkspacePath(cwd, raw)
         const info = await stat(path)
         if (!info.isFile() || info.size > resolved.mediaLimit) {
@@ -1059,8 +1096,9 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
     kind: 'prefix',
     path: '/sidebar/html',
     handler: async (req, res) => {
-      if (!fence(req)) {
-        res.writeHead(403)
+      const rejection = rejectionOf(req)
+      if (rejection !== undefined) {
+        res.writeHead(rejection)
         res.end('forbidden')
         return
       }
@@ -1077,11 +1115,8 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
           return
         }
         const { sessionId, path } = decoded.ref
-        // The session's authoritative cwd (client cwd cannot ride in the URL
-        // — the path encoding has no query; a detached first request falls
-        // back to the process cwd and is normally refused by the workspace
-        // real-path guard, with the same semantics as the media route's
-        // fallback.
+        // The session's authoritative cwd (the server's record; an unknown
+        // session is refused), and the decoded path is confined to it.
         const cwd = await sessionCwdOf(ctx, sessionId)
         const absolute = await ensureWorkspacePath(cwd, path)
         const info = await stat(absolute)
@@ -1133,7 +1168,7 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
   // reader's expanded-folder set; the host watches exactly those directories
   // and pushes a debounced notice per change, so the tree re-lists in place.
   // Paths are resolved exactly like `fs.tree`'s (same resolution, same
-  // lexical rules), so the watch observes what the tree can list.
+  // containment), so the watch observes what the tree can list.
   const fsWatchWss = new WebSocketServer({ noServer: true })
   ctx.effect(() => ctx.webServer.registerUpgrade({
     path: '/sidebar/ws/fs-watch',

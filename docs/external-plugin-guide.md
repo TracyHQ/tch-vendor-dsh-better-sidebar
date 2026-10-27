@@ -593,11 +593,11 @@ const { value } = await res.json()   // 错误时 { ok: false, error: { code, me
 | `pty.close` / `agent-pty.close` | **已删除**（插件自带的 PTY 栈随终端一起移除；宿主 `ui-sidebar-terminal` 不通过本插件的路由暴露控制面） |
 | `settings.get` / `settings.update` | 侧边栏偏好读写（revision 守卫，冲突回 wire 错误码 `settings-conflict`）；后端在 0.1.7 上就是宿主的 `SettingsForms`，见 §8.2 |
 
-> **文件路径语义（v0.23.0 起：无包含检查）**：`fs.tree`、`fs.trees`、`fs.read`、`fs.write`、`fs.rename`、`fs.remove`、`fs.mkdir`、`/sidebar/file`、`/sidebar/html`、`/sidebar/upload` 和 `archive.build` 仍以请求对应 session 的权威 `cwd` 作为**相对路径的基准**，但**不再把 `cwd` 当边界**：绝对路径原样使用，`..` 只做词法折叠，符号链接跟随，越界不再是 403。安全影响见 §8.1 的醒目声明。
+> **文件路径语义**：`fs.tree`、`fs.trees`、`fs.read`、`fs.write`、`fs.rename`、`fs.remove`、`fs.mkdir`、`/sidebar/file`、`/sidebar/html`、`/sidebar/upload` 和 `archive.build` 以请求对应 session 的**服务端记录** `cwd` 作为相对路径的基准**与边界**：目标经 realpath 后越出 `cwd` 即 403，未知 session 即 404。详见 §8.1。
 
 ### 6.1 打包下载（`archive.build` / `archive.status` / `/sidebar/archive`，v0.22.0+）
 
-把若干文件/目录打成 ZIP 下载，并且**有进度可看**：选择项在 `archive.build` 里一次性收集（与 `fs.tree` 同一套词法解析——**无包含检查**，目录递归、符号链接跳过、同名条目用父目录消歧），打包在后台进行，客户端轮询进度、完成后取字节。
+把若干文件/目录打成 ZIP 下载，并且**有进度可看**：选择项在 `archive.build` 里一次性收集（与 `fs.tree` 同一套解析与包含检查，目录递归、符号链接跳过、同名条目用父目录消歧），打包在后台进行，客户端轮询进度、完成后取字节。
 
 ```ts
 // 1) 启动：paths 是会话命名空间里的绝对路径（与 fs.tree 的行 path 同形）
@@ -872,7 +872,7 @@ ctx.effect(() =>
 - 展示：小卡片网格（图标 + 标题 + 类型 id），**高亮 = 启用**，勾选徽标钉在卡片最右端；viewer 卡片额外显示扩展名。
 - 持久化：开关写入 `SidebarPrefs.tabsEnabled / viewersEnabled`（开放 map，**缺省 = 启用**，显式 `false` 才禁用）。
 - 关闭语义：tab 从 `+` 菜单消失、`openTab` 拒绝新开（`console.warn`）、派生流程（子代理自动展开、agent 终端自动补 tab）停止，**已打开的 tab 保留**；viewer 被 `matchFileViewer` 跳过，文件落到下一个匹配。
-- `settings.toggles`（可选）：在卡片行下追加**嵌套设置行**（仅父级启用时显示），绑定 `SidebarPrefs` 字段；通过卡片底部「功能设置」条在原生弹窗中编辑。行控件形状见 §4.1 的 `SettingRow`：`type: 'switch' | 'text' | 'number'`（v0.11.0+；text/number 行 blur/Enter 提交，number 行按 min/max 钳制，unit 渲染单位后缀）与 `type: 'select'`（v0.13.0+；`options` 支持 value/title/desc/icon，`multi` 多选存数组并按 options 顺序提交；任一项带 icon 时渲染大图标选项卡）。内置示例：subagent tab 的 `autoOpenSubagent`、editor tab 的 `editorExplorer` 图标化下拉（工作区路径围栏与它的开关已移除，见 §8.1）。
+- `settings.toggles`（可选）：在卡片行下追加**嵌套设置行**（仅父级启用时显示），绑定 `SidebarPrefs` 字段；通过卡片底部「功能设置」条在原生弹窗中编辑。行控件形状见 §4.1 的 `SettingRow`：`type: 'switch' | 'text' | 'number'`（v0.11.0+；text/number 行 blur/Enter 提交，number 行按 min/max 钳制，unit 渲染单位后缀）与 `type: 'select'`（v0.13.0+；`options` 支持 value/title/desc/icon，`multi` 多选存数组并按 options 顺序提交；任一项带 icon 时渲染大图标选项卡）。内置示例：subagent tab 的 `autoOpenSubagent`、editor tab 的 `editorExplorer` 图标化下拉（工作区包含检查无开关，见 §8.1）。
 - `settings.pluginToggles`（可选，v0.12.0+）：**插件自有设置行**，行控件与 toggles 相同，但 key 是插件局部的——持久化在 prefs 文档的 `pluginSettings[<descriptor id>]`（开放 map，无需宿主 schema 字段）。tab 与 viewer 都可用（v0.12.0 起 viewer 卡片也有设置条）。
 - `settings.render`（可选，v0.12.0+）：**自定义设置面板**——追加渲染在行列表之后，可单独存在。props 含 store/service/prefs、本 descriptor 的 `pluginSettings` blob、`updatePluginSetting(key, value)` 与 `close()`；抛错会被吞掉并显示内联错误。
 
@@ -956,17 +956,16 @@ interface SettingsDescriptor {
 4. **`settings/document-updated` 你监听不到，别写**：事件签名是 `'settings/document-updated'(ns, revision)`（语义是「该条目的表单值 / 可用性 / 页面策略变了，表单客户端重新读取 schema、解析值与 revision」），但它在 **settings 服务自己的 context 上 `emit`**，而 cordis 事件只向该 ctx 的**祖先**冒泡——插件 fiber 是兄弟，`ctx.on(...)` 永远不会触发。**替代做法：每次重新读取表单时重新求值**（本插件的 `settingsFace.get()` 在返回当前值前跑一遍门控同步；客户端侧另经 `remote` 服务的 `$on('settings/document-updated')` 镜像触发重新拉取）。**旧文档里的 `settings/updated` 事件在 0.1.7 已不存在**。
 
 
-### 8.1 工作区包含检查已移除（v0.23.0，权限放开）
+### 8.1 鉴权与工作区包含检查（安全修复，恢复包含检查）
 
-**`workspaceFence` 这个键已经不存在了，也没有替代开关。** 侧栏的文件系统路由（`fs.tree` / `fs.trees` / `fs.read` / `fs.write` / `fs.rename` / `fs.remove` / `fs.mkdir` / `/sidebar/file` 媒体 / `/sidebar/html` 预览 / `/sidebar/upload` / `archive.build`）**不再做任何工作区包含检查**：路径只做词法解析（会话相对路径拼到会话 cwd 下、`resolve()` 折叠 `..`），不再 realpath、不再比对前缀、**不再有 403 `forbidden` 分支**。符号链接被照常跟随。
+侧栏的全部 HTTP / WebSocket 路由（`/sidebar/api/*`、`/sidebar/upload`、`/sidebar/file`、`/sidebar/html`、`/sidebar/archive`、`/sidebar/bundle`、`/sidebar/ws/*`）现在两层准入：① 插件自己的 Host/Origin 栅栏（`src/trust-fence.ts`，保留为额外一层）；② 宿主 Connection 的**鉴权**准入 `ctx.connection.requestRejection(req)`（`@deepseek-ai/dsh-client-connection`：同一套 Host/Origin 规则 + 启动 token 换来的签名 cookie），未通过回 401/403。`connection` 因此进了插件的 `inject`；宿主不提供该检查时一律 401（fail closed）。
 
-> ## ⚠️ 安全声明（必读）
->
-> 这是一次**权限放开**：插件侧边栏的 fs 路由现在能读写**宿主用户能访问的任意路径**，只受 OS 权限约束。也就是说，一个能访问到本插件 `/sidebar/*` 路由的同源页面/脚本（**包括你写的第三方消费插件**）可以借这些路由读取、改写、删除该用户权限内的任何文件——例如 `~/.ssh/`、`~/.dsh/`、其他项目的源码。
->
-> 缓解手段只有两块，别指望有第三块：① 每条路由都过同一个**浏览器信任栅栏**（Host 头 loopback / `trustedHosts`，见 §0 与 §10），所以前提是攻击面已经能发同源请求；② 宿主用户的 OS 权限本身的边界。**不要**再把「工作区围栏」当成安全边界来设计你的插件——它已经不在了。
+文件系统路由（`fs.tree` / `fs.trees` / `fs.read` / `fs.write` / `fs.rename` / `fs.remove` / `fs.mkdir` / `/sidebar/file` / `/sidebar/html` / `/sidebar/upload` / `archive.build` / 目录 watch），以及带路径的 git 路由（`git.diff` / `git.stage` / `git.unstage` / `git.discard` 的 `path`、`git.show` 的修订树路径——会话位于仓库子目录时，仓库顶层其余文件同样 403）：
 
-历史背景（`< v0.23.0`）：旧的实现用 realpath 解析后比对工作区前缀，越界回 403，并有一个 `workspaceFence` 开关（默认开）可临时关闭；开启时编辑器/文件树错误面会显示原因 + 一键关闭按钮（`FenceErrorNotice`）。用户要求删除该检查，上述代码路径随之删除（`src/path-security.ts` 现在是纯词法解析）。旧 profile 里遗留的 `workspaceFence` 键只是**未知键**——schemastery 的 object schema 对未知键是容忍的，既不报错也不再有任何效果。
+- **会话的 cwd 只取服务端记录**（活会话 header → session-persistence 索引），请求里的 `cwd` 一律忽略；宿主不认识的 `sessionId` 回 404 `not-found`（不再回落到客户端 cwd 或宿主进程 cwd）。
+- **包含检查恢复且无开关**：目标经 `realpath` 规范化后必须落在规范化的会话 cwd 之下，否则 403 `forbidden`；写入目标不存在时以**最近存在祖先**的 realpath 判定；重命名/删除对父目录 realpath、对末段保留原样（符号链接行操作链接本身）。指向工作区外的符号链接因此不可读写。
+
+历史背景：v0.23.0 曾按用户要求删除包含检查（`workspaceFence` 开关一并删除），结果是未鉴权的同源/本机请求可读写宿主用户权限内的任意文件。本次修复恢复了检查（不再提供开关）；旧 profile 里遗留的 `workspaceFence` 键只是**未知键**，不报错、也不能关闭检查。
 
 ---
 

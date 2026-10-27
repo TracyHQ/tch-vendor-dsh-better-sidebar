@@ -60,27 +60,25 @@ describe('mkdirWorkspaceEntry', () => {
     expect(await codeOf(() => mkdirWorkspaceEntry({ cwd: root, path: root, name: 'taken' }))).toBe('fs-error')
   })
 
-  it('creates a directory under a parent outside the workspace (fence removed)', async () => {
+  it('refuses a parent outside the workspace (403)', async () => {
     const outside = await mkdtemp(join(tmpdir(), 'dsh-outside-'))
     try {
       await writeFile(join(outside, 'marker.txt'), 'x')
-      // ⚠️ PERMISSION CHANGE: no containment → any writable parent is legal.
-      const result = await mkdirWorkspaceEntry({ cwd: root, path: outside, name: 'allowed' })
-      expect(result.path).toBe(join(outside, 'allowed'))
-      expect(await readdir(outside)).toEqual(['allowed', 'marker.txt'])
+      await expect(mkdirWorkspaceEntry({ cwd: root, path: outside, name: 'refused' }))
+        .rejects.toMatchObject({ code: 'forbidden', status: 403 })
+      expect(await readdir(outside)).toEqual(['marker.txt'])
     } finally {
       await rm(outside, { recursive: true, force: true })
     }
   })
 
-  it('creates INSIDE a symlink that points outside the workspace', async () => {
+  it('refuses creating INSIDE a symlink that points outside the workspace (403)', async () => {
     const outside = await mkdtemp(join(tmpdir(), 'dsh-link-'))
     try {
       await symlink(outside, join(root, 'escape'))
-      // The link is followed like any directory (no realpath guard).
-      const result = await mkdirWorkspaceEntry({ cwd: root, path: join(root, 'escape'), name: 'inside-link' })
-      expect(result.path).toBe(join(root, 'escape', 'inside-link'))
-      expect(await readdir(outside)).toEqual(['inside-link'])
+      await expect(mkdirWorkspaceEntry({ cwd: root, path: join(root, 'escape'), name: 'inside-link' }))
+        .rejects.toMatchObject({ code: 'forbidden', status: 403 })
+      expect(await readdir(outside)).toEqual([])
     } finally {
       await rm(outside, { recursive: true, force: true })
     }

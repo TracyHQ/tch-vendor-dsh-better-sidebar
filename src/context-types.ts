@@ -792,6 +792,14 @@ export interface SidebarContextShape {
       subscribe(listener: () => void): () => void
     }
     reconnect(): void
+    /**
+     * HOST side only (`@deepseek-ai/dsh-client-connection`'s
+     * HostConnectionService, same `connection` service name): Connection's
+     * Host/Origin checks plus browser authentication (the launch-token
+     * signed cookie) applied to another Web route. Returns the rejection
+     * status, or undefined when the request may proceed.
+     */
+    requestRejection?(request: { headers: SidebarHttpRequest['headers'] }): 401 | 403 | undefined
   }
   /** The composer draft face (client ui-conversation, lazy `ctx.get` probe). */
   conversation: SidebarConversation

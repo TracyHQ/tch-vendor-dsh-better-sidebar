@@ -66,11 +66,12 @@ function mount(initialTrustedHosts: readonly string[] = []): {
   const effects: Array<() => void | (() => void)> = []
   const ctx = {
     webRuntime: runtime,
+    connection: { requestRejection: () => undefined },
     webServer: {
       register: (route: SidebarWebRoute) => { routes.push(route); return () => {} },
       registerUpgrade: (route: SidebarWebUpgradeRoute) => { upgrades.push(route); return () => {} },
     },
-    sessions: { get: () => undefined },
+    sessions: { get: (id: string) => (id === 'test-session' ? { header: { cwd: process.cwd() } } : undefined) },
     tools: { register: () => () => {} },
     effect: (fn: () => void | (() => void)) => {
       const cleanup = fn()
