@@ -31,10 +31,10 @@ import {
   type SidebarConfig,
   type SidebarPrefs,
 } from './config.ts'
-import { invalidateDirectoryCache, listDirectory, messageOf, parentOf, requireAbsolute, rootLabel, type SidebarFsEntry } from './fs-tree.ts'
+import { invalidateDirectoryCache, listDirectory, messageOf, parentOf, requireAbsolute, respellListing, rootLabel, type SidebarFsEntry } from './fs-tree.ts'
 import { resolveSessionPath } from './session-path.ts'
 import { mkdirWorkspaceEntry, renameWorkspaceEntry, removeWorkspaceEntry, writeWorkspaceUpload } from './fs-operations.ts'
-import { ensureWorkspacePath, ensureWorkspaceWritePath } from './path-security.ts'
+import { ensureWorkspacePath, ensureWorkspaceWritePath, type WorkspacePath } from './path-security.ts'
 import { searchFiles } from './fs-search.ts'
 import { decodeHtmlUrl } from './html-route.ts'
 import { isTrustedApiRequest } from './trust-fence.ts'
@@ -176,11 +176,11 @@ async function resolveGitPath(cwd: string, raw: string, selected?: string): Prom
  * relative as git status reports it) and confine it to the session workspace.
  * Uses the write-path check (realpath of the nearest existing ancestor)
  * because a git path may name a file deleted from the worktree.
- * @returns the canonical absolute path to hand to git.
+ * @returns the canonical (checked) absolute path to hand to git.
  * @throws SidebarError `forbidden` (403) outside the workspace.
  */
 async function containedGitPath(cwd: string, raw: string, selected?: string): Promise<string> {
-  return ensureWorkspaceWritePath(cwd, await resolveGitPath(cwd, raw, selected))
+  return (await ensureWorkspaceWritePath(cwd, await resolveGitPath(cwd, raw, selected))).real
 }
 
 /**
@@ -310,8 +310,9 @@ function buildApi(
     'fs.tree': async (payload) => {
       const { cwd } = await cwdOf(payload)
       const record = payload as { path?: unknown }
-      const target = record.path === undefined ? cwd : await ensureWorkspacePath(cwd, requireString(payload, 'path'))
-      return listDirectory(target, resolved.listLimit)
+      // Listed (and cached) at the canonical path; answered in the caller's spelling.
+      const target = await ensureWorkspacePath(cwd, record.path === undefined ? cwd : requireString(payload, 'path'))
+      return respellListing(await listDirectory(target.real, resolved.listLimit), target.display)
     },
     // Batch listing: one request for every level the tree has expanded, so a
     // mount/refresh costs one round trip instead of N. Each path rides the
@@ -333,7 +334,8 @@ function buildApi(
         // cwd-relative paths); `fs.tree` itself keeps requiring absolute input.
         const requested = isAbsolute(raw) ? raw : `${cwd}${sep}${raw}`
         try {
-          return await listDirectory(await ensureWorkspacePath(cwd, requested), resolved.listLimit)
+          const target = await ensureWorkspacePath(cwd, requested)
+          return respellListing(await listDirectory(target.real, resolved.listLimit), target.display)
         } catch (error) {
           // Per-level failure: the batch itself stays a success (one unreadable
           // directory must not blank the whole tree).
@@ -357,25 +359,26 @@ function buildApi(
       // child-repo path is relative to the selected repoRoot, not the session
       // cwd; thread it so the path resolves inside the authorized workspace.
       const selected = selectedRepoOf(payload)
-      const path = await ensureWorkspacePath(cwd, await resolveGitPath(cwd, requireString(payload, 'path'), selected))
-      const { content, truncated, binary, size, head } = await readText(path, resolved.readLimit)
+      const { real } = await ensureWorkspacePath(cwd, await resolveGitPath(cwd, requireString(payload, 'path'), selected))
+      const { content, truncated, binary, size, head } = await readText(real, resolved.readLimit)
       if (binary) return { kind: 'binary', size, truncated, head }
       return { kind: 'text', content, truncated }
     },
     'fs.write': async (payload) => {
       const { cwd } = await cwdOf(payload)
-      const path = await ensureWorkspaceWritePath(cwd, requireString(payload, 'path'))
+      // Written at the canonical destination the containment check approved.
+      const { real, display } = await ensureWorkspaceWritePath(cwd, requireString(payload, 'path'))
       const content = requireString(payload, 'content')
-      const tmp = `${path}.dsh-sidebar-tmp-${process.pid}`
+      const tmp = `${real}.dsh-sidebar-tmp-${process.pid}`
       try {
-        await mkdir(dirname(path), { recursive: true })
+        await mkdir(dirname(real), { recursive: true })
         await writeFile(tmp, content, 'utf8')
-        await rename(tmp, path)
+        await rename(tmp, real)
       } catch (error) {
         await rm(tmp, { force: true }).catch(() => {})
-        throw new SidebarError('fs-error', `cannot write "${path}": ${error instanceof Error ? error.message : String(error)}`, 400)
+        throw new SidebarError('fs-error', `cannot write "${display}": ${error instanceof Error ? error.message : String(error)}`, 400)
       }
-      invalidateDirectoryCache(dirname(path))
+      invalidateDirectoryCache(dirname(real))
       return { ok: true }
     },
     // The tree row's rename: single-segment name, destination-existence and
@@ -609,14 +612,15 @@ function buildApi(
         : []
       if (paths.length === 0) throw new SidebarError('bad-request', 'paths must be a non-empty array')
       const name = archiveNameOf(typeof record?.name === 'string' ? record.name : null)
-      const selected: string[] = []
+      const selected: WorkspacePath[] = []
       for (const raw of paths) selected.push(await ensureWorkspacePath(cwd, raw))
       // Same-basename selections (a/index.ts + b/index.ts) get parent segments
-      // prepended, so no two archive members collide.
+      // prepended, so no two archive members collide. Member names follow the
+      // caller's spelling; the walk reads the canonical paths.
       const entries: ZipEntry[] = []
-      const names = disambiguateArchiveNames(selected)
-      for (const [index, absolute] of selected.entries()) {
-        await collectZipEntries(absolute, names[index]!, entries)
+      const names = disambiguateArchiveNames(selected.map(path => path.display))
+      for (const [index, path] of selected.entries()) {
+        await collectZipEntries(path.real, names[index]!, entries)
       }
       return archiveTasks.start({ sessionId, name, entries })
     },
@@ -1060,13 +1064,15 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
         const raw = url.searchParams.get('path')
         if (sessionId === null || raw === null) throw new SidebarError('bad-request', 'sessionId and path are required')
         const cwd = await sessionCwdOf(ctx, sessionId)
-        const path = await ensureWorkspacePath(cwd, raw)
-        const info = await stat(path)
+        // Read at the canonical path; type and download name follow the
+        // caller's spelling (the name the user asked for).
+        const { real, display: path } = await ensureWorkspacePath(cwd, raw)
+        const info = await stat(real)
         if (!info.isFile() || info.size > resolved.mediaLimit) {
           throw new SidebarError('fs-error', 'not a file or too large', 400)
         }
         const type = mediaTypeForPath(path)
-        const body = await readFile(path)
+        const body = await readFile(real)
         // Raw bytes either way (binary-safe); ?download=1 switches the
         // disposition so the browser saves the file instead of showing it.
         const headers: Record<string, string> = { 'content-type': type, 'cache-control': 'no-cache' }
@@ -1118,13 +1124,13 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
         // The session's authoritative cwd (the server's record; an unknown
         // session is refused), and the decoded path is confined to it.
         const cwd = await sessionCwdOf(ctx, sessionId)
-        const absolute = await ensureWorkspacePath(cwd, path)
-        const info = await stat(absolute)
+        const { real, display } = await ensureWorkspacePath(cwd, path)
+        const info = await stat(real)
         if (!info.isFile() || info.size > resolved.mediaLimit) {
           throw new SidebarError('fs-error', 'not a file or too large', 400)
         }
-        const type = mediaTypeForPath(absolute)
-        const body = await readFile(absolute)
+        const type = mediaTypeForPath(display)
+        const body = await readFile(real)
         res.writeHead(200, {
           'content-type': type === 'text/html' ? 'text/html; charset=utf-8' : type,
           'cache-control': 'no-cache',
@@ -1265,13 +1271,17 @@ async function handleFsWatchFrame(
   if (path === undefined || path === '') return
   try {
     const cwd = await sessionCwdOf(ctx, sessionId)
-    const dir = await ensureWorkspacePath(cwd, path)
     if (frame.op === 'unwatch') {
-      watchers.remove(dir)
+      // Releasing a handle touches no file: keyed by the caller's spelling,
+      // with no realpath (the directory may already be gone).
+      watchers.remove(requireAbsolute(resolveSessionPath(cwd, path)))
       return
     }
     if (frame.op !== 'watch') return
-    const ok = watchers.add(dir)
+    // Keyed and reported in the caller's spelling; the OS watcher (and the
+    // listing-cache invalidation) uses the canonical directory.
+    const { real, display: dir } = await ensureWorkspacePath(cwd, path)
+    const ok = watchers.add(dir, real)
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ dir, ok }))
   } catch (error) {
     // The tree keeps working without live refresh; a refused path is reported

@@ -36,7 +36,8 @@ export function pageUrl(extra: Record<string, string>): string {
   return pageUrlWith(RAW_URL, extra)
 }
 
-/** Absolute URL for the plugin's own (public, unauthenticated) API route. */
+/** Absolute URL for the plugin's own API route. The /sidebar routes require
+ *  the host auth cookie: call them through {@link createHostApi}'s context. */
 export function sidebarApi(path: string): string {
   return `${ORIGIN}/sidebar/api/${path}`
 }

@@ -3,9 +3,13 @@
  *
  * Every route that touches the host filesystem resolves the client's target
  * through this module: the (possibly WSL-projected) path is made absolute,
- * canonicalized through `realpath` (so a symlink inside the workspace cannot
- * lead out of it), and refused with 403 when the canonical target is not under
- * the canonical session workspace. The workspace itself is the session's own
+ * and refused with 403 when its `realpath` is not under the session
+ * workspace's `realpath` (so a symlink inside the workspace cannot lead out of
+ * it, and Windows short names / letter case cannot fool the comparison).
+ * Every function returns BOTH forms ({@link WorkspacePath}): the canonical
+ * path that was checked, which every filesystem operation must use (closing
+ * the check-then-use gap a swapped symlink component would open), and the
+ * caller's spelling, used only for values returned to the client. The workspace itself is the session's own
  * recorded cwd (see `sessionCwdOf` in index.ts) — never a client value.
  *
  * Commit 5c95002 once removed this guard to "open up" the routes; that let an
@@ -35,48 +39,79 @@ export function assertWithinWorkspace(workspace: string, target: string): void {
   }
 }
 
+/** Whether two canonical paths name the same location (platform case rules). */
+export function samePath(left: string, right: string): boolean {
+  return isWithin(left, right) && isWithin(right, left)
+}
+
 /** The canonical (symlink-free) session workspace root. */
 export async function realWorkspace(cwd: string): Promise<string> {
   return resolveRealPath(requireAbsolute(cwd), 'workspace')
 }
 
 /**
- * Resolve an existing path through symlinks and enforce containment.
+ * One contained path in its two spellings.
+ *
+ * `real` is the canonical path the containment check approved: EVERY
+ * filesystem operation (read, write, mkdir, rename, rm, upload stream, watch,
+ * listing and its cache) must use it, so a symlink component swapped after
+ * the check cannot redirect the operation. `display` is the caller's own
+ * spelling of the same location: use it ONLY for values handed back to the
+ * client (response paths, client-visible watch keys), never for I/O.
+ */
+export interface WorkspacePath {
+  /** Canonical, containment-checked path: the only form used for I/O. */
+  real: string
+  /** The caller's spelling (lexical absolute path): responses only. */
+  display: string
+}
+
+/**
+ * Resolve an existing path and enforce containment.
  *
  * @param cwd - Session workspace directory (the server's own record).
  * @param target - Client-supplied absolute path in the session's namespace.
- * @returns The canonical absolute path used for the filesystem operation.
+ * @returns the canonical path (`real`, for I/O) and the caller's spelling
+ *  (`display`, for responses).
  * @throws SidebarError `forbidden` (403) when the target lies outside the workspace.
  */
-export async function ensureWorkspacePath(cwd: string, target: string): Promise<string> {
-  const absolute = requireAbsolute(resolveSessionPath(cwd, target))
-  const [realCwd, realTarget] = await Promise.all([
+export async function ensureWorkspacePath(cwd: string, target: string): Promise<WorkspacePath> {
+  const display = requireAbsolute(resolveSessionPath(cwd, target))
+  const [realCwd, real] = await Promise.all([
     realWorkspace(cwd),
-    resolveRealPath(absolute, 'target'),
+    resolveRealPath(display, 'target'),
   ])
-  assertWithinWorkspace(realCwd, realTarget)
-  return realTarget
+  assertWithinWorkspace(realCwd, real)
+  return { real, display }
 }
 
 /**
  * Validate a write destination, including destinations that do not exist yet.
- * Existing targets are resolved to catch symlinks; missing targets are checked
- * against the realpath of their nearest existing ancestor before the caller
- * creates or renames. The returned path is rebuilt from that canonical
- * ancestor, so an existing symlink is never left in the path passed to the
- * write operation.
+ * The canonical form of an existing target is its realpath (catching a
+ * symlink that leads out); of a missing target, the realpath of its nearest
+ * existing ancestor plus the missing segments — so the write never passes
+ * through an unchecked symlink.
  *
  * @param cwd - Session workspace directory (the server's own record).
  * @param target - Client-supplied absolute destination path in the session's namespace.
- * @returns A canonical path for an existing target or its nearest existing ancestor.
+ * @returns the canonical destination (`real`, for I/O) and the caller's
+ *  spelling (`display`, for responses).
  * @throws SidebarError `forbidden` (403) when the destination lies outside the workspace.
  */
-export async function ensureWorkspaceWritePath(cwd: string, target: string): Promise<string> {
-  const absolute = requireAbsolute(resolveSessionPath(cwd, target))
-  const realCwd = await realWorkspace(cwd)
+export async function ensureWorkspaceWritePath(cwd: string, target: string): Promise<WorkspacePath> {
+  const display = requireAbsolute(resolveSessionPath(cwd, target))
+  const [realCwd, real] = await Promise.all([realWorkspace(cwd), canonicalDestination(display)])
+  assertWithinWorkspace(realCwd, real)
+  return { real, display }
+}
+
+/**
+ * The canonical form of a possibly-missing path: realpath of the nearest
+ * existing ancestor joined with the missing segments.
+ */
+async function canonicalDestination(absolute: string): Promise<string> {
   let existingPath = absolute
   const missingSegments: string[] = []
-
   for (;;) {
     let realTarget: string
     try {
@@ -93,9 +128,7 @@ export async function ensureWorkspaceWritePath(cwd: string, target: string): Pro
       existingPath = parent
       continue
     }
-    const destination = missingSegments.reduce((path, segment) => join(path, segment), realTarget)
-    assertWithinWorkspace(realCwd, destination)
-    return destination
+    return missingSegments.reduce((path, segment) => join(path, segment), realTarget)
   }
 }
 
@@ -107,15 +140,17 @@ export async function ensureWorkspaceWritePath(cwd: string, target: string): Pro
  *
  * @param cwd - Session workspace directory (the server's own record).
  * @param target - Client-supplied absolute path of the row.
- * @returns the canonical entry path and the canonical workspace root.
+ * @returns `real`: canonical parent + the row's own name (for I/O and the
+ *  "is this the root" comparison against `realCwd`); `display`: the caller's
+ *  spelling (responses only).
  */
-export async function ensureWorkspaceEntry(cwd: string, target: string): Promise<{ entry: string; realCwd: string }> {
-  const absolute = requireAbsolute(resolveSessionPath(cwd, target))
+export async function ensureWorkspaceEntry(cwd: string, target: string): Promise<WorkspacePath & { realCwd: string }> {
+  const display = requireAbsolute(resolveSessionPath(cwd, target))
   const realCwd = await realWorkspace(cwd)
-  const parent = dirname(absolute)
-  const entry = parent === absolute
-    ? absolute
-    : join(await resolveRealPath(parent, 'target'), basename(absolute))
-  assertWithinWorkspace(realCwd, entry)
-  return { entry, realCwd }
+  const parent = dirname(display)
+  const real = parent === display
+    ? await resolveRealPath(display, 'target')
+    : join(await resolveRealPath(parent, 'target'), basename(display))
+  assertWithinWorkspace(realCwd, real)
+  return { real, display, realCwd }
 }

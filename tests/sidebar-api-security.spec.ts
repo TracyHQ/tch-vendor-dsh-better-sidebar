@@ -287,6 +287,9 @@ describe('/sidebar git routes: workspace containment (nested session in a reposi
     git('config', 'user.email', 'test@example.invalid')
     git('config', 'user.name', 'test')
     git('config', 'commit.gpgsign', 'false')
+    // Windows runners default to core.autocrlf=true, which would make the
+    // discard/checkout cases write CRLF; the cases compare exact bytes.
+    git('config', 'core.autocrlf', 'false')
     writeFileSync(join(repo, 'top.txt'), 'top original\n')
     writeFileSync(join(sub, 'inner.txt'), 'inner original\n')
     git('add', '-A')
@@ -375,5 +378,111 @@ describe('/sidebar git routes: workspace containment (nested session in a reposi
     const discard = await post('git.discard', { sessionId: GIT_SESSION, path: 'sub/inner.txt' })
     expect(discard.status).toBe(200)
     expect(readFileSync(join(sub, 'inner.txt'), 'utf8')).toBe('inner original\n')
+  })
+})
+
+describe('/sidebar routes: returned paths keep the caller\'s spelling', () => {
+  // The session workspace is reached through a symlink, so its realpath is
+  // spelled differently from the cwd the session records — the Linux stand-in
+  // for a Windows 8.3 short name (`RUNNER~1` vs `runneradmin`). Containment
+  // compares realpaths; everything the routes hand back must keep the
+  // caller's spelling.
+  let base: string
+  let real: string
+  let linked: string
+  let api: SidebarWebRoute
+  let upload: SidebarWebRoute
+  const SPELL_SESSION = 's-spelling'
+
+  const send = async (route: SidebarWebRoute, url: string, payload: unknown): Promise<{ status: number; body: { ok: boolean; value?: unknown; error?: { code?: string } } }> => {
+    const body = Buffer.from(typeof payload === 'string' ? payload : JSON.stringify(payload))
+    const req = {
+      method: 'POST',
+      url,
+      headers: { host: '127.0.0.1:3080' },
+      [Symbol.asyncIterator]: async function* () { yield body },
+    } as never
+    const out = { status: 200, text: '' }
+    const res = {
+      writeHead: (status: number) => { out.status = status },
+      end: (chunk: unknown) => { out.text += String(chunk ?? '') },
+    } as never
+    await route.handler(req, res)
+    return { status: out.status, body: JSON.parse(out.text) as never }
+  }
+  const post = (method: string, payload: unknown) => send(api, `/sidebar/api/${method}`, payload)
+
+  beforeAll(() => {
+    if (!canCreateSymlink) return
+    base = realpathSync(mkdtempSync(join(tmpdir(), 'dsh-sidebar-spelling-')))
+    real = join(base, 'real-workspace')
+    linked = join(base, 'linked-workspace')
+    mkdirSync(join(real, 'src'), { recursive: true })
+    writeFileSync(join(real, 'src', 'a.txt'), 'a')
+    writeFileSync(join(base, 'outside.txt'), 'outside')
+    symlinkSync(real, linked)
+    const routes: SidebarWebRoute[] = []
+    apply({
+      webRuntime: { trustedHosts: [] },
+      connection: { requestRejection: () => undefined },
+      webServer: {
+        register: (route: SidebarWebRoute) => { routes.push(route); return () => {} },
+        registerUpgrade: () => () => {},
+      },
+      sessions: { get: (id: string) => (id === SPELL_SESSION ? { header: { cwd: linked } } : undefined) },
+      tools: { register: () => () => {} },
+      effect: (fn: () => void | (() => void)) => {
+        const cleanup = fn()
+        if (typeof cleanup === 'function') effects.push(cleanup)
+      },
+      inject: () => () => {},
+      on: () => () => {},
+      get: () => undefined,
+      logger: { warn: () => {} },
+    } as never)
+    api = routes.find(route => route.path === '/sidebar/api')!
+    upload = routes.find(route => route.path === '/sidebar/upload')!
+  })
+
+  afterAll(() => {
+    if (base !== undefined) rmSync(base, { recursive: true, force: true })
+  })
+
+  it.skipIf(!canCreateSymlink)('fs.tree / fs.trees answer with the requested spelling', async () => {
+    const tree = await post('fs.tree', { sessionId: SPELL_SESSION, path: join(linked, 'src') })
+    expect(tree.status).toBe(200)
+    expect((tree.body.value as { path: string }).path).toBe(join(linked, 'src'))
+    const trees = await post('fs.trees', { sessionId: SPELL_SESSION, paths: [linked, join(linked, 'src')] })
+    expect(trees.status).toBe(200)
+    expect((trees.body.value as { levels: Array<{ path: string }> }).levels.map(level => level.path))
+      .toEqual([linked, join(linked, 'src')])
+  })
+
+  it.skipIf(!canCreateSymlink)('fs.mkdir / fs.rename / upload return the requested spelling', async () => {
+    const made = await post('fs.mkdir', { sessionId: SPELL_SESSION, path: join(linked, 'src'), name: 'fresh' })
+    expect(made.status).toBe(200)
+    expect((made.body.value as { path: string }).path).toBe(join(linked, 'src', 'fresh'))
+    const renamed = await post('fs.rename', { sessionId: SPELL_SESSION, path: join(linked, 'src', 'fresh'), name: 'renamed' })
+    expect(renamed.status).toBe(200)
+    expect((renamed.body.value as { path: string }).path).toBe(join(linked, 'src', 'renamed'))
+    const params = new URLSearchParams({ sessionId: SPELL_SESSION, dir: join(linked, 'src'), relativePath: 'up.txt' })
+    const uploaded = await send(upload, `/sidebar/upload?${params.toString()}`, 'bytes')
+    expect(uploaded.status).toBe(200)
+    expect((uploaded.body.value as { path: string }).path).toBe(join(linked, 'src', 'up.txt'))
+    expect(readFileSync(join(real, 'src', 'up.txt'), 'utf8')).toBe('bytes')
+  })
+
+  it.skipIf(!canCreateSymlink)('still refuses the workspace root itself and paths outside it', async () => {
+    // Through its canonical spelling the root is refused as the root; rename/remove
+    // are link-aware, so the LINK itself (the session cwd spelling) is a row
+    // outside the canonical workspace and refused as such. Nothing is removed.
+    expect((await post('fs.remove', { sessionId: SPELL_SESSION, path: real })).body.error?.code).toBe('fs-error')
+    expect((await post('fs.remove', { sessionId: SPELL_SESSION, path: linked })).status).toBe(403)
+    expect((await post('fs.rename', { sessionId: SPELL_SESSION, path: join(linked, 'src', '..'), name: 'x' })).status).toBe(403)
+    expect(existsSync(join(real, 'src'))).toBe(true)
+    expect(existsSync(linked)).toBe(true)
+    expect((await post('fs.read', { sessionId: SPELL_SESSION, path: join(linked, '..', 'outside.txt') })).status).toBe(403)
+    expect((await post('fs.write', { sessionId: SPELL_SESSION, path: join(base, 'new.txt'), content: 'x' })).status).toBe(403)
+    expect(existsSync(join(base, 'new.txt'))).toBe(false)
   })
 })

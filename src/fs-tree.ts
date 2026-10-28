@@ -134,6 +134,24 @@ export async function listDirectory(path: string, maxEntries = 1000): Promise<Si
   return await listDirectoryCached(path, maxEntries)
 }
 
+/**
+ * Re-spell a listing read at its canonical path in the caller's spelling:
+ * the level path and every row path get `display` as their prefix. The
+ * cached listing is never mutated (a fresh object is returned).
+ * @param listing - the listing as read (and cached) at the canonical path.
+ * @param display - the caller's spelling of the same directory.
+ * @returns the listing as the client should see it.
+ */
+export function respellListing(listing: SidebarFsListing, display: string): SidebarFsListing {
+  if (listing.path === display) return listing
+  const prefix = display.endsWith(sep) ? display : `${display}${sep}`
+  return {
+    path: display,
+    truncated: listing.truncated,
+    entries: listing.entries.map(entry => ({ ...entry, path: `${prefix}${entry.name}` })),
+  }
+}
+
 /** Read one level straight from the filesystem (the cache's slow path). */
 async function readDirectory(path: string, maxEntries: number): Promise<SidebarFsListing> {
   let dirents
