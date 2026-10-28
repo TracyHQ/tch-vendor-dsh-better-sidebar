@@ -22,6 +22,8 @@ import { join, sep } from 'node:path'
 import WebSocket from 'ws'
 import { apply } from '../src/index.ts'
 import { invalidateDirectoryCache } from '../src/fs-tree.ts'
+import { collectZipEntries } from '../src/archive-route.ts'
+import { buildZip, type ZipEntry } from '../src/zip.ts'
 import type { SidebarWebRoute, SidebarWebUpgradeRoute } from '../src/context-types.ts'
 
 /** The I/O recorder shared with the hoisted module mocks. */
@@ -248,6 +250,25 @@ describe.skipIf(!canCreateSymlink)('/sidebar routes act on the canonical path (w
     expect((batch.result.body.value as { levels: Array<{ path: string }> }).levels[0]!.path).toBe(linked)
   })
 
+  it('listing: a symlink row leading out of the workspace is not followed', async () => {
+    const outsideDir = join(base, 'outside-dir')
+    mkdirSync(outsideDir, { recursive: true })
+    const link = join(real, 'src', 'out-link')
+    symlinkSync(outsideDir, link, 'junction')
+    try {
+      invalidateDirectoryCache()
+      const { result, calls } = await recorded(() => post('fs.tree', { sessionId: SESSION, path: join(linked, 'src') }))
+      // Every readdir/stat stays inside the real workspace: the outside
+      // target is never stat'ed.
+      expectCanonical(calls, ['readdir', 'stat'])
+      const row = (result.body.value as { entries: Array<{ name: string; isDir: boolean; broken: boolean }> }).entries.find(entry => entry.name === 'out-link')
+      expect(row).toMatchObject({ isDir: false, broken: true })
+    } finally {
+      rmSync(link, { force: true })
+      invalidateDirectoryCache()
+    }
+  })
+
   it('read: fs.read, /sidebar/file and /sidebar/html read the canonical file', async () => {
     const read = await recorded(() => post('fs.read', { sessionId: SESSION, path: join(linked, 'src', 'a.txt') }))
     expectCanonical(read.calls, ['stat', 'open'])
@@ -344,6 +365,51 @@ describe.skipIf(!canCreateSymlink)('/sidebar routes act on the canonical path (w
       await vi.waitFor(() => { expect(frames).toContainEqual({ dir: display }) }, { timeout: 3_000 })
     } finally {
       ws.close()
+    }
+  })
+})
+
+describe.skipIf(!canCreateSymlink)('archive read: containment before any stat/lstat/open of the entry', () => {
+  it('never touches the outside file when a collected file\'s parent is swapped for a link leading out', async () => {
+    const zipRoot = join(real, 'zip-case')
+    const outsideDir = join(base, 'zip-outside')
+    mkdirSync(join(zipRoot, 'nested'), { recursive: true })
+    mkdirSync(outsideDir, { recursive: true })
+    writeFileSync(join(zipRoot, 'nested', 'a.txt'), 'inside')
+    writeFileSync(join(outsideDir, 'a.txt'), 'OUTSIDE SECRET')
+    try {
+      const entries: ZipEntry[] = []
+      await collectZipEntries(join(zipRoot, 'nested'), 'nested', entries, undefined, real)
+      rmSync(join(zipRoot, 'nested'), { recursive: true })
+      symlinkSync(outsideDir, join(zipRoot, 'nested'), 'junction')
+      const { result, calls } = await recorded(() => buildZip(entries).then(() => 'built', (error: unknown) => error))
+      expect(result).toMatchObject({ code: 'fs-error' })
+      // The containment check (realpath inside the root) runs first: no
+      // stat/lstat/open of the entry follows it out of the workspace.
+      for (const call of calls) {
+        expect(isUnder(outsideDir, call.path), `${call.fn}(${call.path}) touched the outside file`).toBe(false)
+      }
+      expect(calls.filter(call => call.fn === 'stat' || call.fn === 'open')).toEqual([])
+    } finally {
+      rmSync(zipRoot, { recursive: true, force: true })
+      rmSync(outsideDir, { recursive: true, force: true })
+    }
+  })
+
+  it('still archives a normal nested folder (identity checks pass)', async () => {
+    const zipRoot = join(real, 'zip-normal')
+    mkdirSync(join(zipRoot, 'nested', 'deeper'), { recursive: true })
+    writeFileSync(join(zipRoot, 'nested', 'a.txt'), 'inside a')
+    writeFileSync(join(zipRoot, 'nested', 'deeper', 'b.txt'), 'inside b')
+    try {
+      const entries: ZipEntry[] = []
+      await collectZipEntries(join(zipRoot, 'nested'), 'nested', entries, undefined, real)
+      const archive = await buildZip(entries)
+      for (const name of ['nested/', 'nested/a.txt', 'nested/deeper/', 'nested/deeper/b.txt']) {
+        expect(archive.includes(Buffer.from(name)), name).toBe(true)
+      }
+    } finally {
+      rmSync(zipRoot, { recursive: true, force: true })
     }
   })
 })

@@ -14,7 +14,7 @@
  * symlinks stat'ed once so a link to a directory expands like a directory and
  * a dangling one is flagged broken.
  */
-import { readdir, stat } from 'node:fs/promises'
+import { readdir, realpath, stat } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, resolve, sep } from 'node:path'
 import { SidebarError } from './wire.ts'
 
@@ -76,9 +76,11 @@ export const DIRECTORY_CACHE_TTL_MS = 1_500
  */
 const directoryCache = new Map<string, { at: number; listing: SidebarFsListing }>()
 
-/** Cache key of one level read. */
-function cacheKey(path: string, maxEntries: number): string {
-  return `${path}\0${maxEntries}`
+/** Cache key of one level read. The containment root is part of the key:
+ *  symlink rows are only followed when their target lies inside it, so the
+ *  same directory can list differently for two (nested) workspaces. */
+function cacheKey(path: string, maxEntries: number, root: string | undefined): string {
+  return `${path}\0${maxEntries}\0${root ?? ''}`
 }
 
 /**
@@ -106,12 +108,12 @@ export function invalidateDirectoryCache(path?: string): void {
 const DIRECTORY_CACHE_MAX = 512
 
 /** Read one level through the cache when it is fresh. */
-async function listDirectoryCached(path: string, maxEntries: number): Promise<SidebarFsListing> {
-  const key = cacheKey(path, maxEntries)
+async function listDirectoryCached(path: string, maxEntries: number, root: string | undefined): Promise<SidebarFsListing> {
+  const key = cacheKey(path, maxEntries, root)
   const now = Date.now()
   const hit = directoryCache.get(key)
   if (hit !== undefined && now - hit.at < DIRECTORY_CACHE_TTL_MS) return hit.listing
-  const listing = await readDirectory(path, maxEntries)
+  const listing = await readDirectory(path, maxEntries, root)
   // Bounded: a deep walk of many directories must not grow this map without
   // limit (entries are tiny, but an unbounded map in a long-lived host is a
   // leak). Map iteration order is insertion order, so the first key is oldest.
@@ -127,11 +129,15 @@ async function listDirectoryCached(path: string, maxEntries: number): Promise<Si
  * List one directory level (cached for {@link DIRECTORY_CACHE_TTL_MS}).
  * @param path - absolute directory path.
  * @param maxEntries - row bound of one level (extra rows flag `truncated`).
+ * @param root - canonical containment root (the session workspace). When set,
+ *  a symlink row is only followed (stat'ed) when its canonical target lies
+ *  inside it; a link leading out is kept as a row but reported the way the
+ *  client shows a link it cannot open (`isDir: false`, `broken: true`).
  * @returns the sorted listing.
  * @throws {SidebarError} fs-error when the level is unreadable or not a directory.
  */
-export async function listDirectory(path: string, maxEntries = 1000): Promise<SidebarFsListing> {
-  return await listDirectoryCached(path, maxEntries)
+export async function listDirectory(path: string, maxEntries = 1000, root?: string): Promise<SidebarFsListing> {
+  return await listDirectoryCached(path, maxEntries, root)
 }
 
 /**
@@ -153,7 +159,7 @@ export function respellListing(listing: SidebarFsListing, display: string): Side
 }
 
 /** Read one level straight from the filesystem (the cache's slow path). */
-async function readDirectory(path: string, maxEntries: number): Promise<SidebarFsListing> {
+async function readDirectory(path: string, maxEntries: number, root: string | undefined): Promise<SidebarFsListing> {
   let dirents
   try {
     // One syscall batch instead of an `opendir` stream: `readdir` with types is
@@ -187,13 +193,13 @@ async function readDirectory(path: string, maxEntries: number): Promise<SidebarF
   // symlink-heavy level (UNC/network targets) would otherwise serialize up to
   // maxEntries stat calls and stall the explorer. Non-symlink rows are skipped,
   // so levels without links stay as cheap as before.
-  await probeSymlinkTargets(rows)
+  await probeSymlinkTargets(rows, root)
   rows.sort(compareEntries)
   return { path, entries: rows, truncated }
 }
 
 /** Probe each symlink row's target once (bounded concurrency, order-preserving). */
-async function probeSymlinkTargets(rows: SidebarFsEntry[], concurrency = SYMLINK_PROBE_CONCURRENCY): Promise<void> {
+async function probeSymlinkTargets(rows: SidebarFsEntry[], root: string | undefined, concurrency = SYMLINK_PROBE_CONCURRENCY): Promise<void> {
   let next = 0
   const workers = Array.from({ length: Math.min(concurrency, rows.length) }, async () => {
     for (;;) {
@@ -204,7 +210,20 @@ async function probeSymlinkTargets(rows: SidebarFsEntry[], concurrency = SYMLINK
       if (!row.isSymlink) continue
       // stat follows the chain; any failure (missing target, ELOOP, permission)
       // leaves the row as a broken file-shaped link the editor refuses to read.
-      const info = await stat(row.path).catch(() => undefined)
+      // With a containment root the target is resolved first and only stat'ed
+      // (canonically) when it lies inside the root: a link leading out is
+      // reported the same broken, file-shaped way, without touching its target.
+      let target = row.path
+      if (root !== undefined) {
+        const real = await realpath(row.path).catch(() => undefined)
+        if (real === undefined || !isWithin(root, real)) {
+          row.isDir = false
+          row.broken = true
+          continue
+        }
+        target = real
+      }
+      const info = await stat(target).catch(() => undefined)
       row.isDir = info !== undefined ? info.isDirectory() : row.isDir
       row.broken = info === undefined
     }

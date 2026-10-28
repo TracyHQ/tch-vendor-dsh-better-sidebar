@@ -34,7 +34,7 @@ import {
 import { invalidateDirectoryCache, listDirectory, messageOf, parentOf, requireAbsolute, respellListing, rootLabel, type SidebarFsEntry } from './fs-tree.ts'
 import { resolveSessionPath } from './session-path.ts'
 import { mkdirWorkspaceEntry, renameWorkspaceEntry, removeWorkspaceEntry, writeWorkspaceUpload } from './fs-operations.ts'
-import { ensureWorkspacePath, ensureWorkspaceWritePath, type WorkspacePath } from './path-security.ts'
+import { ensureWorkspacePath, ensureWorkspaceWritePath, realWorkspace, type WorkspacePath } from './path-security.ts'
 import { searchFiles } from './fs-search.ts'
 import { decodeHtmlUrl } from './html-route.ts'
 import { isTrustedApiRequest } from './trust-fence.ts'
@@ -173,29 +173,35 @@ async function resolveGitPath(cwd: string, raw: string, selected?: string): Prom
 
 /**
  * Resolve a git-route path (absolute, session-relative, or repository-root-
- * relative as git status reports it) and confine it to the session workspace.
- * Uses the write-path check (realpath of the nearest existing ancestor)
- * because a git path may name a file deleted from the worktree.
+ * relative as git status reports it) and confine it to the REPOSITORY ROOT.
+ * Git actions cover the whole repository, even when the session cwd is a
+ * subdirectory of it (owner decision); what is refused is anything leaving
+ * the repository (`..` past its root, an absolute path elsewhere, a symlink
+ * pointing out). Uses the write-path check (realpath of the nearest existing
+ * ancestor, canonical root) because a git path may name a file deleted from
+ * the worktree.
  * @returns the canonical (checked) absolute path to hand to git.
- * @throws SidebarError `forbidden` (403) outside the workspace.
+ * @throws SidebarError `forbidden` (403) outside the repository.
  */
 async function containedGitPath(cwd: string, raw: string, selected?: string): Promise<string> {
-  return (await ensureWorkspaceWritePath(cwd, await resolveGitPath(cwd, raw, selected))).real
+  const root = await git.repoRoot(cwd, selected)
+  return (await ensureWorkspaceWritePath(root, await resolveGitPath(cwd, raw, selected))).real
 }
 
 /**
  * Confine a revision-tree path (`git show <rev>:<path>`, repository-relative)
- * to the session workspace: the path is normalized, must stay below the
- * repository root, and its worktree location must lie inside the workspace.
+ * to the repository: the path is normalized, must not climb above the
+ * repository root, and its worktree location (through realpath, so a symlink
+ * pointing out is refused) must lie inside the repository root.
  * @returns the normalized repository-relative path to hand to git.
  */
 async function containedRevisionPath(cwd: string, raw: string, selected?: string): Promise<string> {
   const normalized = posix.normalize(raw.replace(/\\/g, '/'))
   if (normalized === '..' || normalized.startsWith('../') || posix.isAbsolute(normalized) || isAbsolute(raw)) {
-    throw new SidebarError('forbidden', `path "${raw}" is outside workspace`, 403)
+    throw new SidebarError('forbidden', `path "${raw}" is outside the repository`, 403)
   }
   const root = await git.repoRoot(cwd, selected)
-  await ensureWorkspaceWritePath(cwd, requireAbsolute(join(root, normalized)))
+  await ensureWorkspaceWritePath(root, requireAbsolute(join(root, normalized)))
   return normalized
 }
 
@@ -311,8 +317,9 @@ function buildApi(
       const { cwd } = await cwdOf(payload)
       const record = payload as { path?: unknown }
       // Listed (and cached) at the canonical path; answered in the caller's spelling.
+      // Symlink rows are only followed inside the workspace root.
       const target = await ensureWorkspacePath(cwd, record.path === undefined ? cwd : requireString(payload, 'path'))
-      return respellListing(await listDirectory(target.real, resolved.listLimit), target.display)
+      return respellListing(await listDirectory(target.real, resolved.listLimit, await realWorkspace(cwd)), target.display)
     },
     // Batch listing: one request for every level the tree has expanded, so a
     // mount/refresh costs one round trip instead of N. Each path rides the
@@ -329,13 +336,19 @@ function buildApi(
       if (paths.length > FS_TREES_MAX_PATHS) {
         throw new SidebarError('bad-request', `too many paths (max ${FS_TREES_MAX_PATHS})`)
       }
+      // The root for the outside-symlink rule. A cwd that no longer resolves
+      // must not fail the batch: each level then reports its own error (the
+      // per-level ensureWorkspacePath below fails on the same cwd), exactly
+      // like any other unreadable level.
+      const root = await realWorkspace(cwd).catch(() => undefined)
       const levels = await Promise.all(paths.map(async (raw): Promise<SidebarFsLevel> => {
         // A session-relative path is accepted here (the tree already carries
         // cwd-relative paths); `fs.tree` itself keeps requiring absolute input.
         const requested = isAbsolute(raw) ? raw : `${cwd}${sep}${raw}`
         try {
           const target = await ensureWorkspacePath(cwd, requested)
-          return respellListing(await listDirectory(target.real, resolved.listLimit), target.display)
+          if (root === undefined) throw new SidebarError('fs-error', `cannot resolve workspace "${cwd}"`, 400)
+          return respellListing(await listDirectory(target.real, resolved.listLimit, root), target.display)
         } catch (error) {
           // Per-level failure: the batch itself stays a success (one unreadable
           // directory must not blank the whole tree).
@@ -593,10 +606,16 @@ function buildApi(
     // client is a browser renderer where raw scheme navigation is
     // unreliable, so the launch always goes through the host — the same
     // fence as every other route, argv-only (no shell interpolation).
-    'open.external': (payload) => {
+    'open.external': async (payload) => {
       const record = payload as { action?: unknown } | null
       const action = record?.action
-      if (action === 'reveal') return launchExternal('reveal', requireString(payload, 'path'))
+      if (action === 'reveal') {
+        // Session-scoped like fs.read: the path must lie inside the session
+        // workspace, and the opener gets the canonical path that was checked.
+        const { cwd } = await cwdOf(payload)
+        const { real } = await ensureWorkspacePath(cwd, requireString(payload, 'path'))
+        return launchExternal('reveal', real)
+      }
       if (action === 'url') return launchExternal('url', requireString(payload, 'url'))
       throw new SidebarError('bad-request', 'action must be "reveal" or "url"')
     },
@@ -619,8 +638,11 @@ function buildApi(
       // caller's spelling; the walk reads the canonical paths.
       const entries: ZipEntry[] = []
       const names = disambiguateArchiveNames(selected.map(path => path.display))
+      // The build reads in the background: every file entry carries the
+      // canonical workspace root so it is re-checked at read time.
+      const root = await realWorkspace(cwd)
       for (const [index, path] of selected.entries()) {
-        await collectZipEntries(path.real, names[index]!, entries)
+        await collectZipEntries(path.real, names[index]!, entries, undefined, root)
       }
       return archiveTasks.start({ sessionId, name, entries })
     },

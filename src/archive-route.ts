@@ -142,6 +142,8 @@ export function disambiguateArchiveNames(selections: readonly string[]): string[
  * @param name - the in-archive name of that selection (its basename).
  * @param out - the entry list appended to, in archive order.
  * @param maxEntries - entry-count bound.
+ * @param root - the canonical workspace root; stamped on every file entry so
+ *  the background build re-checks each file when it actually reads it.
  * @throws {SidebarError} fs-error when a row cannot be read or the bound is hit.
  */
 export async function collectZipEntries(
@@ -149,6 +151,7 @@ export async function collectZipEntries(
   name: string,
   out: ZipEntry[],
   maxEntries = ZIP_MAX_ENTRIES,
+  root?: string,
 ): Promise<void> {
   const stack: Array<{ path: string; name: string }> = [{ path: absolute, name }]
   while (stack.length > 0) {
@@ -166,7 +169,7 @@ export async function collectZipEntries(
       continue
     }
     if (!info.isDirectory()) {
-      out.push({ path: item.path, name: item.name })
+      out.push({ path: item.path, name: item.name, ...(root !== undefined ? { root } : {}) })
       continue
     }
     out.push({ path: item.path, name: item.name, isDir: true })

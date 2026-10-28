@@ -644,6 +644,24 @@ describe('session cwd resolution over the API route', () => {
     }
   })
 
+  it('fs.trees answers 200 with an error on each level when the session cwd no longer exists', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-sidebar-fs-trees-gone-'))
+    const gone = join(root, 'deleted-workspace')
+    rmSync(root, { recursive: true, force: true })
+    const route = mount({ sessions: { get: () => ({ header: { cwd: gone } }) } })
+    const result = await invoke(route, 'fs.trees', { sessionId: 's-gone', paths: [gone, join(gone, 'src')] })
+    expect(result.status).toBe(200)
+    const levels = (result.value as unknown as { levels: Array<{ path: string; entries: unknown[]; error?: string }> }).levels
+    expect(levels.map(level => level.path)).toEqual([gone, join(gone, 'src')])
+    for (const level of levels) {
+      expect(level.entries).toEqual([])
+      expect(typeof level.error).toBe('string')
+    }
+    // The single-level route keeps its error status (as on main).
+    const single = await invoke(route, 'fs.tree', { sessionId: 's-gone' })
+    expect(single).toMatchObject({ ok: false, status: 400, error: { code: 'fs-error' } })
+  })
+
   it('fs.trees rejects an empty list and an oversized batch', async () => {
     const root = mkdtempSync(join(tmpdir(), 'dsh-sidebar-fs-trees-guard-'))
     const workspace = join(root, 'workspace')
@@ -841,7 +859,12 @@ describe('open.external route', () => {
     const route = mountWithSettings()
     const https = await invoke(route, 'open.external', { action: 'url', url: 'https://example.com' })
     expect(https).toMatchObject({ ok: false, error: { code: 'bad-request' } })
-    const relative = await invoke(route, 'open.external', { action: 'reveal', path: 'relative/path' })
+    // reveal is session-scoped: no session → bad-request; a relative path in
+    // a known session → fs-error. Neither reaches launchExternal.
+    const unscoped = await invoke(route, 'open.external', { action: 'reveal', path: '/tmp/a.txt' })
+    expect(unscoped).toMatchObject({ ok: false, error: { code: 'bad-request' } })
+    const scoped = mountWithSettings(undefined, undefined, process.cwd())
+    const relative = await invoke(scoped, 'open.external', { sessionId: 's-open', action: 'reveal', path: 'relative/path' })
     expect(relative).toMatchObject({ ok: false, error: { code: 'fs-error' } })
     // A missing field never reaches launchExternal either.
     const empty = await invoke(route, 'open.external', { action: 'url' })

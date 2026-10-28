@@ -960,10 +960,12 @@ interface SettingsDescriptor {
 
 侧栏的全部 HTTP / WebSocket 路由（`/sidebar/api/*`、`/sidebar/upload`、`/sidebar/file`、`/sidebar/html`、`/sidebar/archive`、`/sidebar/bundle`、`/sidebar/ws/*`）现在两层准入：① 插件自己的 Host/Origin 栅栏（`src/trust-fence.ts`，保留为额外一层）；② 宿主 Connection 的**鉴权**准入 `ctx.connection.requestRejection(req)`（`@deepseek-ai/dsh-client-connection`：同一套 Host/Origin 规则 + 启动 token 换来的签名 cookie），未通过回 401/403。`connection` 因此进了插件的 `inject`；宿主不提供该检查时一律 401（fail closed）。
 
-文件系统路由（`fs.tree` / `fs.trees` / `fs.read` / `fs.write` / `fs.rename` / `fs.remove` / `fs.mkdir` / `/sidebar/file` / `/sidebar/html` / `/sidebar/upload` / `archive.build` / 目录 watch），以及带路径的 git 路由（`git.diff` / `git.stage` / `git.unstage` / `git.discard` 的 `path`、`git.show` 的修订树路径——会话位于仓库子目录时，仓库顶层其余文件同样 403）：
+文件系统路由（`fs.tree` / `fs.trees` / `fs.read` / `fs.write` / `fs.rename` / `fs.remove` / `fs.mkdir` / `/sidebar/file` / `/sidebar/html` / `/sidebar/upload` / `archive.build` / 目录 watch / `open.external` 的 `reveal`——后者需带 `sessionId`）：
 
 - **会话的 cwd 只取服务端记录**（活会话 header → session-persistence 索引），请求里的 `cwd` 一律忽略；宿主不认识的 `sessionId` 回 404 `not-found`（不再回落到客户端 cwd 或宿主进程 cwd）。
 - **包含检查恢复且无开关**：目标经 `realpath` 规范化后必须落在规范化的会话 cwd 之下，否则 403 `forbidden`；写入目标不存在时以**最近存在祖先**的 realpath 判定；重命名/删除对父目录 realpath、对末段保留原样（符号链接行操作链接本身）。指向工作区外的符号链接因此不可读写。
+- **git 路由作用于整个仓库**：带路径的 git 路由（`git.diff` / `git.stage` / `git.unstage` / `git.discard` 的 `path`、`git.show` 的修订树路径）的边界是**仓库根**（realpath 后）而非会话 cwd——会话位于仓库子目录时，仓库内 cwd 之上的文件照常可操作；`..` 越出仓库根、仓库外的绝对路径、指向仓库外的符号链接一律 403。
+- **其余细节**：文件树里指向工作区外的符号链接行保留，但不跟随（`isDir: false`、`broken: true`，与失效链接同样显示）；`archive.build` 在后台读取时逐个复查（拒绝已被换成符号链接或已移出工作区的文件，整个打包失败）；`open.external` 的 `url` 拒绝 `file:` 与盘符形式（`c://…`），编辑器 scheme 不受影响。
 
 历史背景：v0.23.0 曾按用户要求删除包含检查（`workspaceFence` 开关一并删除），结果是未鉴权的同源/本机请求可读写宿主用户权限内的任意文件。本次修复恢复了检查（不再提供开关）；旧 profile 里遗留的 `workspaceFence` 键只是**未知键**，不报错、也不能关闭检查。
 
