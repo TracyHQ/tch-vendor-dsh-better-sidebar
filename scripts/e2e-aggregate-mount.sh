@@ -13,8 +13,9 @@
 #     2. 用官方 CLI 把 fixture 先装进全新 scratch profile，再把插件 tarball
 #        装进同一 profile（复刻真实安装顺序：聚合先行、dsh plugin add 后到）；
 #     3. 启动真实 `dsh web`（keyless，--port 0）；
-#     4. 断言：日志出现启动 URL、无 "duplicate prefix route"、/sidebar/api
-#        路由存活（POST 未知方法应返回 404 JSON 而非崩溃）。
+#     4. 断言：日志出现带 token 的启动 URL、无 "duplicate prefix route"、
+#        未鉴权的 /sidebar/api 请求被 401 拒绝、用 token 换得的 cookie 鉴权后
+#        /sidebar/api 路由存活（POST 未知方法应返回 404 JSON 而非崩溃）。
 #
 # 用法：
 #   bash scripts/e2e-aggregate-mount.sh
@@ -89,11 +90,12 @@ $DSH_CMD plugin --profile web add "file:$TARBALL"
 say "启动 dsh web（--port ${PORT}，日志 ${LOG_DIR}）…"
 e2e_start_dsh_web "$OUT_LOG" "$ERR_LOG"
 
-# 等待启动 URL 或进程退出（最多 120s）。这里有意只取 origin：0.1.2-alpha.1+
-# 的就绪行是 `…/?token=<43字符>` 鉴权 URL，但下方的探活全部打插件的
-# /sidebar/api/* 路由——webserver carrier 不做鉴权（只有 /api、index 与
-# remote.mux 升级在 browser auth 之后），origin 拼路径即正确且两版通用。
-E2E_READY_RE='http://127\.0\.0\.1:[0-9]+'
+# 等待启动 URL 或进程退出（最多 120s）。就绪行是带一次性 token 的鉴权 URL
+# （`dsh web: http://127.0.0.1:<port>/?token=<43字符>`）。/sidebar/* 路由经宿主
+# Connection 的 browser auth 准入（requestRejection：签名 cookie），与 /api 同一
+# 道门——所以必须取完整 URL（匹配延伸到空白，同 e2e-mount.sh），用 token 换
+# cookie 后再探活；只取 origin 的裸 curl 会被 401 拒绝。
+E2E_READY_RE='dsh web: http://127\.0\.0\.1:[0-9]+[^ ]*'
 E2E_READY_PICK=tail
 e2e_wait_dsh_web_ready "$OUT_LOG" || true
 if [ -z "$URL" ]; then
@@ -101,6 +103,17 @@ if [ -z "$URL" ]; then
   warn "err log 尾部：$(tail -5 "$ERR_LOG" 2>/dev/null || true)"
   die "dsh web 未在 120s 内启动"
 fi
+LAUNCH_URL="$URL"
+URL="$(printf '%s' "$LAUNCH_URL" | grep -oE '^http://127\.0\.0\.1:[0-9]+')"
+case "$LAUNCH_URL" in
+  *token=*) ;;
+  *) die "就绪行缺少一次性 token，无法鉴权：$LAUNCH_URL" ;;
+esac
+# token 换 cookie：宿主回 303 + Set-Cookie；不跟随重定向（跟随会丢 Set-Cookie），
+# 与 tests/e2e/host.ts 的 exchangeLaunchCookieViaPlaywright 同一流程。
+COOKIE="$(curl -s -o /dev/null -D - --max-redirs 0 -H 'Accept: text/html' "$LAUNCH_URL" 2>/dev/null \
+  | tr -d '\r' | grep -i '^set-cookie:' | head -1 | sed -E 's/^[Ss]et-[Cc]ookie:[[:space:]]*//; s/;.*$//')"
+[ -n "$COOKIE" ] || die "token 换 cookie 失败（$URL 未返回 Set-Cookie）"
 say "已启动：$URL"
 
 # ── 断言 ────────────────────────────────────────────────────────────────────
@@ -113,13 +126,17 @@ fi
 # 的理由：/sidebar/api 是插件自己 fence 的 prefix 路由，未注册的方法统统 404，
 # 所以 {"ok":true} 只可能来自插件真实注册的 handler —— generic missing-route
 # 404 无法冒充（P2: Probe a real sidebar API method）。
-RESP="$(curl -s -X POST "$URL/sidebar/api/settings.get" 2>/dev/null || true)"
+# 先钉住鉴权门本身：不带 cookie 的同一请求必须 401。
+UNAUTH="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/sidebar/api/settings.get" 2>/dev/null || true)"
+[ "$UNAUTH" = "401" ] || die "未鉴权的 /sidebar/api/settings.get 未被拒绝（HTTP ${UNAUTH}，期望 401）"
+say "/sidebar/api/settings.get 未鉴权 → HTTP 401（鉴权门生效）"
+RESP="$(curl -s -X POST -H "Cookie: $COOKIE" "$URL/sidebar/api/settings.get" 2>/dev/null || true)"
 if ! printf '%s' "$RESP" | grep -q '"ok":true'; then
   die "/sidebar/api/settings.get 未返回 ok:true（响应：$(printf '%s' "$RESP" | head -c 200)）"
 fi
 say "/sidebar/api/settings.get → ok:true（真实 handler 存活）"
 
-STATUS="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/sidebar/api/__e2e_unknown__" 2>/dev/null || true)"
+STATUS="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Cookie: $COOKIE" "$URL/sidebar/api/__e2e_unknown__" 2>/dev/null || true)"
 say "/sidebar/api POST 未知方法 → HTTP ${STATUS}（期望 404）"
 [ "$STATUS" = "404" ] || die "/sidebar/api 未知方法未按预期返回 404（HTTP ${STATUS}）"
 

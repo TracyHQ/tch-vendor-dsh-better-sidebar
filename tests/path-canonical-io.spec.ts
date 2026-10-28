@@ -81,12 +81,13 @@ vi.mock('node:child_process', async (importOriginal) => {
   return { ...wrapped, default: wrapped }
 })
 
-/** Symlink creation may require elevated privileges on Windows. */
+/** Directory links: a junction on Windows (no symlink privilege needed; the
+ *  type argument is ignored elsewhere). Skipped only if even that fails. */
 const canCreateSymlink = (() => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-sidebar-canon-probe-'))
   try {
     mkdirSync(join(dir, 'target'))
-    symlinkSync(join(dir, 'target'), join(dir, 'link'))
+    symlinkSync(join(dir, 'target'), join(dir, 'link'), 'junction')
     return true
   } catch {
     return false
@@ -117,14 +118,19 @@ async function recorded<T>(operation: () => Promise<T>): Promise<{ result: T; ca
   }
 }
 
+/** Path comparison with the platform's case rule (case-insensitive on Windows). */
+const fold = (path: string): string => (process.platform === 'win32' ? path.toLowerCase() : path)
+const samePath = (left: string, right: string): boolean => fold(left) === fold(right)
+const isUnder = (root: string, path: string): boolean => samePath(root, path) || fold(path).startsWith(`${fold(root)}${sep}`)
+
 /** Every recorded I/O path is canonical (under the real workspace), and there was some I/O. */
 function expectCanonical(calls: Array<{ fn: string; path: string }>, fns: readonly string[]): void {
   const relevant = calls.filter(call => fns.some(fn => call.fn.startsWith(fn)))
   expect(relevant.length, `no ${fns.join('/')} call recorded`).toBeGreaterThan(0)
   for (const call of relevant) {
-    expect(call.path === real || call.path.startsWith(`${real}${sep}`), `${call.fn}(${call.path})`).toBe(true)
+    expect(isUnder(real, call.path), `${call.fn}(${call.path}) is not under ${real}`).toBe(true)
   }
-  for (const call of calls) expect(call.path.startsWith(linked), `${call.fn}(${call.path}) used the caller's spelling`).toBe(false)
+  for (const call of calls) expect(isUnder(linked, call.path), `${call.fn}(${call.path}) used the caller's spelling`).toBe(false)
 }
 
 async function post(method: string, payload: unknown): Promise<{ status: number; body: { ok: boolean; value?: unknown; error?: { code?: string } } }> {
@@ -157,13 +163,16 @@ async function send(route: SidebarWebRoute, url: string, method: string, text = 
 
 beforeAll(async () => {
   if (!canCreateSymlink) return
-  base = realpathSync(mkdtempSync(join(tmpdir(), 'dsh-sidebar-canon-')))
+  // The NATIVE realpath, exactly what the code canonicalizes with: on Windows
+  // it expands 8.3 short names (`RUNNER~1` → `runneradmin`) that the JS
+  // `realpathSync` and `os.tmpdir()` keep.
+  base = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-sidebar-canon-')))
   real = join(base, 'real-workspace')
   linked = join(base, 'linked-workspace')
   mkdirSync(join(real, 'src'), { recursive: true })
   writeFileSync(join(real, 'src', 'a.txt'), 'alpha')
   writeFileSync(join(real, 'page.html'), '<p>page</p>')
-  symlinkSync(real, linked)
+  symlinkSync(real, linked, 'junction')
   const git = (...args: string[]): void => {
     const result = spawnSync('git', ['-C', real, ...args], { encoding: 'utf8' })
     if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr}`)
@@ -275,7 +284,7 @@ describe.skipIf(!canCreateSymlink)('/sidebar routes act on the canonical path (w
     const { result, calls } = await recorded(() => post('fs.rename', { sessionId: SESSION, path: join(linked, 'src', 'old.txt'), name: 'renamed.txt' }))
     expect((result.body.value as { path: string }).path).toBe(join(linked, 'src', 'renamed.txt'))
     expectCanonical(calls, ['rename', 'access'])
-    expect(calls.find(call => call.fn === 'rename')?.path).toBe(join(real, 'src', 'old.txt'))
+    expect(samePath(calls.find(call => call.fn === 'rename')?.path ?? '', join(real, 'src', 'old.txt'))).toBe(true)
     expect(readFileSync(join(real, 'src', 'renamed.txt'), 'utf8')).toBe('old')
   })
 
