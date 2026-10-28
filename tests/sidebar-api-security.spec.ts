@@ -273,9 +273,20 @@ describe('/sidebar routes: open.external', () => {
   beforeEach(() => { opened.length = 0 })
 
   it('refuses to reveal a path outside the workspace and launches nothing', async () => {
-    for (const path of [join(outside, 'secret.txt'), '/etc/passwd', `${workspace}/../outside/secret.txt`]) {
+    // An existing system file that is absolute on the running platform: it
+    // resolves, so the refusal is the workspace check itself (403).
+    const systemFile = process.platform === 'win32'
+      ? join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'drivers', 'etc', 'hosts')
+      : '/etc/passwd'
+    for (const path of [join(outside, 'secret.txt'), systemFile, `${workspace}/../outside/secret.txt`]) {
       const result = await call('open.external', { sessionId: SESSION, action: 'reveal', path })
       expect(result.status, path).toBe(403)
+    }
+    if (process.platform === 'win32') {
+      // The POSIX spelling has no drive on Windows: it resolves to a
+      // nonexistent `C:\etc\passwd` and is refused (400) before the
+      // workspace check — still a refusal, still nothing launched.
+      expect((await call('open.external', { sessionId: SESSION, action: 'reveal', path: '/etc/passwd' })).status).toBe(400)
     }
     expect((await call('open.external', { action: 'reveal', path: join(workspace, 'inside.txt') })).status).toBe(400)
     expect(opened).toEqual([])
