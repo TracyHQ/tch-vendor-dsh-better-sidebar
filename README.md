@@ -286,7 +286,7 @@ make clean          # 清理 lib/、*.tgz、playwright-report/、test-results/
 ## 🔐 安全
 
 - 路由受 Host 头信任围栏保护（与 `/api` 一致）；`fs.write` 原子写入；git 只调 CLI、绝不设置身份
-- ⚠️ **v0.23.0 起文件系统路由不再做工作区包含检查**：`fs.tree` / `fs.trees` / `fs.read` / `fs.write` / `fs.rename` / `fs.remove` / `fs.mkdir` / 媒体 / HTML 预览 / `/sidebar/upload` / `archive.build` 能读写**宿主用户可访问的任意路径**（只受 OS 权限约束，`workspaceFence` 开关与 403 分支已删除）——调用方不能再把这些路由当作被围栏保护的接口
+- ⚠️ **（已撤销）v0.23.0 曾删除文件系统路由的工作区包含检查**：该改动已作为安全修复撤销——所有 `/sidebar/*` 路由现在需通过宿主 Connection 的鉴权准入，会话 cwd 只取服务端记录（未知会话 404），文件路由越出工作区（realpath 后）一律 403。见指南 §8.1
 - HTML 预览的内容在**不透明源沙箱 iframe** 中渲染（无 `allow-same-origin`/`allow-top-navigation`、`no-referrer`、权限策略全禁）；`/sidebar/html` 路由带 CSP `sandbox` + 大小/路径边界
 - 设置页可按功能关闭 HTML 预览的沙箱（`htmlViewerNoSandbox` / `htmlViewerDefaultUnsafe`，默认关闭，带警告文案）——关闭后内容与界面同源，仅建议对完全可信内容使用。**网页 tab 的沙箱不再是插件的面**：浏览器视图由宿主提供（desktop profile），其沙箱与导航策略见 DSH 侧文档
 

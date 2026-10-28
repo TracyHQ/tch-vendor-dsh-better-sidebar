@@ -54,26 +54,39 @@ export function urlCommand(url: string, platform: NodeJS.Platform = process.plat
 }
 
 /** Validate a URL-scheme open target: a parseable custom-scheme URL (never
- *  http/https — those would only dump the URL into a browser tab). */
+ *  http/https — those would only dump the URL into a browser tab), and never
+ *  a URL the platform opener resolves to a LOCAL PATH: `file:` (any case,
+ *  surrounding whitespace trimmed) opens the file itself with
+ *  `xdg-open` / `open` / `url.dll,FileProtocolHandler`, and on Windows a
+ *  one-letter "scheme" is a drive letter (`c://Windows/...`) that
+ *  FileProtocolHandler treats as a path. Editor schemes (vscode://,
+ *  cursor://, zed://, custom ones) hand the URL to their own app.
+ *  @returns the trimmed URL actually launched. */
 export function validateExternalUrl(raw: string): string {
-  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
+  const trimmed = raw.trim()
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {
     throw new SidebarError('bad-request', 'url must be a custom-scheme URL')
   }
   let url: URL
   try {
-    url = new URL(raw)
+    url = new URL(trimmed)
   } catch {
     throw new SidebarError('bad-request', 'invalid url')
   }
   if (url.protocol === 'http:' || url.protocol === 'https:') {
     throw new SidebarError('bad-request', 'only custom-scheme urls can be opened externally')
   }
-  return raw
+  if (url.protocol === 'file:' || /^[a-z]:$/i.test(url.protocol)) {
+    throw new SidebarError('bad-request', 'local file urls cannot be opened externally')
+  }
+  return trimmed
 }
 
 /**
  * Launch one external open action and return immediately (detached, no
- * stdio). Spawn failures are reported through the child's 'error' event —
+ * stdio). For `reveal` the caller must pass the CANONICAL path the workspace
+ * containment check approved (the route does; this function only rejects a
+ * non-absolute path). Spawn failures are reported through the child's 'error' event —
  * by then the route already returned, so the event is swallowed (the OS
  * dialog about a missing handler is the user-visible outcome either way).
  */

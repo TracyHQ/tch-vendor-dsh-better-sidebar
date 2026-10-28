@@ -295,7 +295,7 @@ make clean          # remove lib/, *.tgz, playwright-report/, test-results/
 ## 🔐 Security
 
 - Routes protected by a Host-header trust fence (same as `/api`); `fs.write` is atomic; git only shells out to the CLI and never sets identity
-- ⚠️ **Since v0.23.0 the filesystem routes do NO workspace containment**: `fs.tree` / `fs.trees` / `fs.read` / `fs.write` / `fs.rename` / `fs.remove` / `fs.mkdir` / media / HTML preview / `/sidebar/upload` / `archive.build` reach **any path the host user can reach** (OS permissions are the only bound; the `workspaceFence` switch and the 403 branch are gone) — do not treat these routes as fenced
+- ⚠️ **(Reverted) v0.23.0 removed workspace containment from the filesystem routes**: reverted as a security fix — every `/sidebar/*` route now goes through the host Connection's authenticated admission, the session cwd comes only from the server's record (unknown session → 404), and file routes refuse anything that resolves (after realpath) outside the workspace (403). See guide §8.1
 - HTML preview content renders in an **opaque-origin sandboxed iframe** (no `allow-same-origin`/`allow-top-navigation`, `no-referrer`, all permission policies disabled); the `/sidebar/html` route carries a CSP `sandbox` + size/path bounds
 - The settings page can disable the HTML preview's sandbox per feature (`htmlViewerNoSandbox` / `htmlViewerDefaultUnsafe`, off by default, with a warning) — when off, content shares the origin with the UI; only recommended for fully trusted content. **The web tab's sandbox is no longer this plugin's surface**: the browser view comes from the host (desktop profile); see DSH's own docs for its sandbox and navigation policy
 

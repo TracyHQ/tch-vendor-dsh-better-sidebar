@@ -40,10 +40,14 @@ export interface DirectoryWatchEvent {
 export interface DirectoryWatchers {
   /**
    * Start watching one directory.
-   * @param dir - absolute directory to watch; already-watched paths are a no-op.
+   * @param dir - the directory as the client names it: the watch key, and the
+   *   `dir` reported in change events; already-watched keys are a no-op.
+   * @param realDir - the canonical (containment-checked) directory the OS
+   *   watcher is opened on and whose listing cache is invalidated; defaults to
+   *   `dir`.
    * @returns true when the directory is now watched (or already was).
    */
-  add(dir: string): boolean
+  add(dir: string, realDir?: string): boolean
   /**
    * Stop watching one directory; idempotent.
    * @param dir - absolute directory that was passed to {@link add}.
@@ -68,7 +72,7 @@ export function createDirectoryWatchers(
   push: (event: DirectoryWatchEvent) => void,
   onError: (dir: string, error: unknown) => void,
 ): DirectoryWatchers {
-  const watchers = new Map<string, { watcher: FSWatcher; timer: NodeJS.Timeout | undefined }>()
+  const watchers = new Map<string, { watcher: FSWatcher; realDir: string; timer: NodeJS.Timeout | undefined }>()
 
   const drop = (dir: string): void => {
     const entry = watchers.get(dir)
@@ -91,7 +95,7 @@ export function createDirectoryWatchers(
       // themselves; this covers everything that changed BEHIND the plugin
       // (another editor, a build, the model's own bash), which is exactly why
       // the watcher exists.
-      invalidateDirectoryCache(dir)
+      invalidateDirectoryCache(entry.realDir)
       push({ dir })
     }, DEBOUNCE_MS)
     // A pending re-list must never hold the host process open.
@@ -99,12 +103,12 @@ export function createDirectoryWatchers(
   }
 
   return {
-    add(dir) {
+    add(dir, realDir = dir) {
       if (watchers.has(dir)) return true
       if (watchers.size >= MAX_WATCHES) return false
       let watcher: FSWatcher
       try {
-        watcher = watch(dir, { persistent: false })
+        watcher = watch(realDir, { persistent: false })
       } catch (error) {
         onError(dir, error)
         return false
@@ -114,7 +118,7 @@ export function createDirectoryWatchers(
         onError(dir, error)
         drop(dir)
       })
-      watchers.set(dir, { watcher, timer: undefined })
+      watchers.set(dir, { watcher, realDir, timer: undefined })
       return true
     },
     remove: drop,

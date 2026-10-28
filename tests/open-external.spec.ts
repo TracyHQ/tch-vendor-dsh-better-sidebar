@@ -60,6 +60,18 @@ describe('validateExternalUrl', () => {
     expect(() => validateExternalUrl('a:file/x')).toThrow(SidebarError)
     expect(() => validateExternalUrl('')).toThrow(SidebarError)
   })
+
+  it('rejects URLs the opener resolves to a local path (file:, drive letters), any case and padding', () => {
+    for (const url of ['file:///etc/passwd', 'FILE:///etc/passwd', ' file:///etc/passwd ', 'file://localhost/etc/passwd', 'c://Windows/System32/calc.exe', 'C://x']) {
+      expect(() => validateExternalUrl(url), url).toThrow(SidebarError)
+    }
+  })
+
+  it('keeps editor schemes working and launches the trimmed URL', () => {
+    expect(validateExternalUrl('cursor://file/home/u/a.ts:3')).toBe('cursor://file/home/u/a.ts:3')
+    expect(validateExternalUrl('zed://file/home/u/a.ts')).toBe('zed://file/home/u/a.ts')
+    expect(validateExternalUrl('  vscode://file/a.ts\n')).toBe('vscode://file/a.ts')
+  })
 })
 
 describe('launchExternal validation (pre-spawn)', () => {

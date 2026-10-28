@@ -66,7 +66,7 @@
    **保留在插件侧的三件**：`md/markdown`（自带渲染器，用户认为优于内置）、`html/htm`（自带沙箱预览 + `htmlViewerNoSandbox` / `htmlViewerDefaultUnsafe`，宿主没有这两个开关）、以及 `code` catch-all（**它是可编辑的 CodeMirror + 保存**，内置那几个是只读预览）。未知二进制（`.zip`/`.wasm`）仍走 `code` 认领 → 宿主 fsRead 判 binary → head 重匹配无 sniffer → `EditorHost.tsx` 的 `load.status === 'binary'` 兜底渲染下载面板，**功能不回归**。
 6. **宿主 `browser` kind 在 Web profile 不再挂载**：`packages/bundle/web-app/cordis.patch.yml` 给 `ui-sidebar-browser` 加了 `disabled: !!js "ctx.get('profileContext')?.name !== 'desktop'"`。因此 e2e 的 `HOST_OWNED_TABS` 只剩 `['terminal']`，并且**显式断言 browser 条目缺席**（钉住新真值，而不是默默放宽）。DSH 同时新增用户设置 `linkOpening` 决定正文链接进侧栏还是新标签页。
 7. **外链接管收敛**：删掉 `browserInterceptLinks` / `browserInterceptHttp` / `browserInterceptHttps` 三个偏好键（含 20 份词典的 key）。新行为是**只认领声明了 `urlTarget` 的链接**，其余一律不 `preventDefault`、放行给宿主；认领成功但目标类型此刻不可用时 `window.open(url, '_blank', 'noopener,noreferrer')` 兜底。**修掉了一个真实回归**：0.1.6 那版把浏览器交还宿主时，`openInSidebar` 仍兜底到 `'browser'`，而插件注册表里已无该类型、`service.openTab` 对未注册类型静默 `return`——默认配置下插件自绘 markdown（sidechat 转录 / 编辑器预览 / diff）里的 http 链接**点了没反应**。
-8. **文件树新增实时刷新**：插件接管了 `files` kind，所以宿主自己的按目录 watch 覆盖不到它。新增 `src/fs-watch.ts`（宿主侧，每条连接一组 `fs.watch`，150ms 去抖，上限 64 个句柄）+ `src/client/use-dir-watch.ts`（一条 `/sidebar/ws/fs-watch` socket 携带展开目录集，目录折叠即退订），客户端收到通知后只丢弃并重列那一层缓存。路径解析沿用 `fs.tree` 的同一套词法解析（v0.23.0 起无工作区包含检查）。
+8. **文件树新增实时刷新**：插件接管了 `files` kind，所以宿主自己的按目录 watch 覆盖不到它。新增 `src/fs-watch.ts`（宿主侧，每条连接一组 `fs.watch`，150ms 去抖，上限 64 个句柄）+ `src/client/use-dir-watch.ts`（一条 `/sidebar/ws/fs-watch` socket 携带展开目录集，目录折叠即退订），客户端收到通知后只丢弃并重列那一层缓存。路径解析与包含检查沿用 `fs.tree` 的同一套（realpath 后不得越出会话 cwd）。
 
 ### 3.3 既有缺陷（不是 0.1.7 引入，但这次一并修）
 

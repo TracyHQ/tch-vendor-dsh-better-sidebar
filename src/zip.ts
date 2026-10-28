@@ -13,7 +13,9 @@
  * BEFORE it is read, so a runaway selection fails with a clear error instead
  * of filling memory with an archive nobody asked for.
  */
-import { readFile, stat } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { lstat, open, readFile, realpath, stat } from 'node:fs/promises'
+import { isWithin } from './fs-tree.ts'
 import { deflateRaw } from 'node:zlib'
 import { promisify } from 'node:util'
 import { SidebarError } from './wire.ts'
@@ -29,6 +31,10 @@ export interface ZipEntry {
   /** Write a directory entry (zero-length name + trailing '/') instead of
    *  reading the path as a file. */
   isDir?: boolean
+  /** Canonical containment root (the session workspace). When set, the
+   *  background read re-checks the file at READ time — it may have been
+   *  swapped since it was collected — see {@link readContainedFile}. */
+  root?: string
 }
 
 /** One progress report: entries finished, entries total, bytes read so far. */
@@ -144,7 +150,8 @@ function requireSourcePath(raw: string): string {
  *  FIRST and refused when it cannot fit, so an oversized archive never pulls
  *  the payload into memory (let alone deflates it) before failing.
  */
-async function prepareFile(name: string, path: string, limit: number, budget: number): Promise<ZipMember> {
+async function prepareFile(name: string, path: string, limit: number, budget: number, root?: string): Promise<ZipMember> {
+  if (root !== undefined) return compressMember(name, await readContainedFile(path, root, limit, budget))
   let size: number
   try {
     size = (await stat(path)).size
@@ -163,6 +170,63 @@ async function prepareFile(name: string, path: string, limit: number, budget: nu
   } catch (error) {
     throw new SidebarError('fs-error', `cannot read "${path}": ${error instanceof Error ? error.message : String(error)}`, 400)
   }
+  return compressMember(name, data)
+}
+
+/** Flags for the contained read: never follow a final symlink, and never
+ *  block on a FIFO swapped in after the lstat (both POSIX-only; Windows has
+ *  neither flag, and the inode checks below still apply). */
+const CONTAINED_OPEN_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)
+
+/**
+ * Read one collected file at build time without trusting the collect-time
+ * check (the archive builds in the background, so the path may have been
+ * swapped since). Order matters — containment comes BEFORE any
+ * stat/lstat/open of the entry, so a path that now leads out of the
+ * workspace is refused without touching the outside file:
+ * 1. the path's realpath must lie inside `root`;
+ * 2. the path must still be a regular file (lstat — a symlink or anything
+ *    else is refused);
+ * 3. it is opened without following a final symlink, and the opened handle
+ *    must be the very inode that was lstat'ed;
+ * 4. the path, resolved again after the open, must still lie inside `root`
+ *    and name that same inode (closing the gap between steps 1 and 3).
+ * @throws {SidebarError} fs-error when any check fails or the read fails.
+ */
+async function readContainedFile(path: string, root: string, limit: number, budget: number): Promise<Buffer> {
+  const refuse = (reason: string): never => {
+    throw new SidebarError('fs-error', `cannot read "${path}": ${reason}`, 400)
+  }
+  const failed = (error: unknown): never => refuse(error instanceof Error ? error.message : String(error))
+  const outside = 'changed since it was selected (no longer inside the workspace)'
+  const containedReal = async (): Promise<string> => {
+    const real = await realpath(path).catch(failed)
+    if (!isWithin(root, real)) refuse(outside)
+    return real
+  }
+  await containedReal()
+  const before = await lstat(path, { bigint: true }).catch(failed)
+  if (!before.isFile()) refuse('no longer a regular file inside the workspace')
+  // Same budget rule as the unchecked path: refused before any open().
+  if (budget <= 0 || before.size > BigInt(budget)) {
+    throw new SidebarError('fs-error', `archive exceeds the ${limit} byte limit`, 400)
+  }
+  const handle = await open(path, CONTAINED_OPEN_FLAGS).catch(failed)
+  try {
+    const opened = await handle.stat({ bigint: true })
+    const sameInode = (a: { dev: bigint; ino: bigint }, b: { dev: bigint; ino: bigint }): boolean => a.dev === b.dev && a.ino === b.ino
+    if (!sameInode(opened, before)) refuse(outside)
+    const real = await containedReal()
+    const atReal = await stat(real, { bigint: true }).catch(failed)
+    if (!sameInode(opened, atReal)) refuse(outside)
+    return await handle.readFile()
+  } finally {
+    await handle.close()
+  }
+}
+
+/** Checksum + compress one file's bytes (deflate only when it shrinks). */
+async function compressMember(name: string, data: Buffer): Promise<ZipMember> {
   const crc = crc32(data)
   const deflated = await deflateRawAsync(data)
   const useDeflate = deflated.byteLength < data.byteLength
@@ -234,7 +298,7 @@ export async function buildZip(entries: readonly ZipEntry[], opts: ZipOptions = 
     // The bound is the archive's total UNCOMPRESSED payload: that is what the
     // reader materializes, and it makes the limit independent of how well the
     // input happens to compress.
-    const member = await prepareFile(archiveName(entry.name, false), path, maxBytes, maxBytes - totalBytes)
+    const member = await prepareFile(archiveName(entry.name, false), path, maxBytes, maxBytes - totalBytes, entry.root)
     // A source can grow AFTER its stat (sparse files, concurrent writers), so
     // the ceiling is re-checked against what was actually read.
     if (totalBytes + member.size > maxBytes) {

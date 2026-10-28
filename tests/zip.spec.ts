@@ -13,7 +13,7 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { validateHeaderValue } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -106,16 +106,23 @@ function readZip(archive: Buffer): ParsedEntry[] {
   return entries
 }
 
+/**
+ * The fake host session store: a test's `cwd` is registered here as the
+ * session's server-side record (the routes never read a client cwd).
+ */
+const sessionCwds = new Map<string, string>()
+
 /** The host mounted against a fake context: both archive routes + the API. */
 function mountHost(): { api: SidebarWebRoute; download: SidebarWebRoute } {
   const routes: SidebarWebRoute[] = []
   const ctx = {
     webRuntime: { trustedHosts: [] },
+    connection: { requestRejection: () => undefined },
     webServer: {
       register: (route: SidebarWebRoute) => { routes.push(route); return () => {} },
       registerUpgrade: (route: SidebarWebUpgradeRoute) => { void route; return () => {} },
     },
-    sessions: { get: () => undefined },
+    sessions: { get: (id: string) => (sessionCwds.has(id) ? { header: { cwd: sessionCwds.get(id) } } : undefined) },
     tools: { register: () => () => {} },
     effect: (fn: () => void | (() => void)) => { fn() },
     inject: () => () => {},
@@ -136,6 +143,8 @@ async function post(
   method: string,
   payload: unknown,
 ): Promise<{ status: number; ok: boolean; value?: unknown; error?: { code?: string; message?: string } }> {
+  const record = payload as { sessionId?: unknown; cwd?: unknown }
+  if (typeof record.sessionId === 'string' && typeof record.cwd === 'string') sessionCwds.set(record.sessionId, record.cwd)
   const body = Buffer.from(JSON.stringify(payload))
   const req = {
     method: 'POST',
@@ -214,6 +223,20 @@ async function archiveFlow(input: {
 
 /** A temp workspace (plus an outside sibling) removed after each test. */
 const roots: string[] = []
+/** Directory/file links available here (a junction on Windows needs no privilege). */
+const canSymlink = (() => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-sidebar-zip-probe-'))
+  try {
+    writeFileSync(join(dir, 'f'), '')
+    symlinkSync(join(dir, 'f'), join(dir, 'link'))
+    return true
+  } catch {
+    return false
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})()
+
 function tempRoot(): string {
   const root = mkdtempSync(join(tmpdir(), 'dsh-sidebar-zip-'))
   roots.push(root)
@@ -468,6 +491,61 @@ describe('collectZipEntries', () => {
     const entries: ZipEntry[] = []
     await expect(collectZipEntries(join(root, 'missing'), 'missing', entries))
       .rejects.toMatchObject({ code: 'fs-error' })
+  })
+})
+
+describe('archive read-time containment (collect → swap → build)', () => {
+  /** A workspace and a sibling outside file; the root is canonical (native realpath). */
+  const layout = (): { workspace: string; outside: string } => {
+    const base = realpathSync.native(tempRoot())
+    const workspace = join(base, 'workspace')
+    mkdirSync(join(workspace, 'nested', 'deeper'), { recursive: true })
+    writeFileSync(join(workspace, 'a.txt'), 'inside a')
+    writeFileSync(join(workspace, 'nested', 'a.txt'), 'inside nested a')
+    writeFileSync(join(workspace, 'nested', 'deeper', 'b.txt'), 'inside b')
+    const outside = join(base, 'outside.txt')
+    writeFileSync(outside, 'OUTSIDE SECRET')
+    return { workspace, outside }
+  }
+
+  it.skipIf(!canSymlink)('refuses a collected file replaced by a symlink to an outside file before the background read', async () => {
+    const { workspace, outside } = layout()
+    const entries: ZipEntry[] = []
+    await collectZipEntries(join(workspace, 'a.txt'), 'a.txt', entries, undefined, workspace)
+    // The check passed at collect time; the swap happens before the build reads.
+    rmSync(join(workspace, 'a.txt'))
+    symlinkSync(outside, join(workspace, 'a.txt'))
+    const built = await buildZip(entries).then(
+      archive => ({ ok: true as const, outsideContentInZip: archive.includes(Buffer.from('OUTSIDE SECRET')) || readZip(archive).some(entry => entry.data.toString('utf8') === 'OUTSIDE SECRET') }),
+      (error: unknown) => ({ ok: false as const, error }),
+    )
+    expect(built.ok ? built.outsideContentInZip : false).toBe(false)
+    expect(built.ok).toBe(false)
+    if (!built.ok) expect(built.error).toMatchObject({ code: 'fs-error' })
+  })
+
+  it.skipIf(!canSymlink)('refuses a collected file whose parent directory is swapped for a symlink leading out', async () => {
+    const { workspace, outside } = layout()
+    const entries: ZipEntry[] = []
+    await collectZipEntries(join(workspace, 'nested'), 'nested', entries, undefined, workspace)
+    // Swap the directory for a link to a directory that holds the same names.
+    const decoy = join(outside, '..', 'decoy')
+    mkdirSync(join(decoy, 'deeper'), { recursive: true })
+    writeFileSync(join(decoy, 'a.txt'), 'OUTSIDE SECRET')
+    writeFileSync(join(decoy, 'deeper', 'b.txt'), 'OUTSIDE SECRET')
+    rmSync(join(workspace, 'nested'), { recursive: true })
+    symlinkSync(decoy, join(workspace, 'nested'), 'junction')
+    await expect(buildZip(entries)).rejects.toMatchObject({ code: 'fs-error' })
+  })
+
+  it('keeps normal archives (files, nested folders, same-basename names) unchanged with a root', async () => {
+    const { workspace } = layout()
+    const entries: ZipEntry[] = []
+    await collectZipEntries(join(workspace, 'a.txt'), 'a.txt', entries, undefined, workspace)
+    await collectZipEntries(join(workspace, 'nested'), 'nested', entries, undefined, workspace)
+    const archive = readZip(await buildZip(entries))
+    expect(archive.map(entry => entry.name)).toEqual(['a.txt', 'nested/', 'nested/a.txt', 'nested/deeper/', 'nested/deeper/b.txt'])
+    expect(archive.find(entry => entry.name === 'nested/a.txt')!.data.toString('utf8')).toBe('inside nested a')
   })
 })
 
@@ -836,24 +914,17 @@ describe('archive task flow (build → status → download)', () => {
     expect(byName.get('b/index.ts')!.data.toString('utf8')).toBe('from b\n')
   })
 
-  it('zips a path outside the session workspace (fence removed)', async () => {
+  it('refuses to zip a path outside the session workspace (403)', async () => {
     const root = tempRoot()
     const workspace = join(root, 'workspace')
     const outside = join(root, 'outside')
     mkdirSync(workspace)
     mkdirSync(outside)
     writeFileSync(join(outside, 'secret.txt'), 'secret')
-    const { download } = await archiveFlow({
-      sessionId: 's-zip',
-      cwd: workspace,
-      paths: [join(outside, 'secret.txt')],
-    })
-    // ⚠️ PERMISSION CHANGE: an absolute path outside the workspace is now a
-    // normal selection (no 403 branch exists any more).
-    expect(download.status).toBe(200)
-    const entries = readZip(download.body)
-    expect(entries.map(entry => entry.name)).toEqual(['secret.txt'])
-    expect(entries[0]!.data.toString('utf8')).toBe('secret')
+    const { api } = mountHost()
+    const build = await post(api, 'archive.build', { sessionId: 's-zip', cwd: workspace, paths: [join(outside, 'secret.txt')] })
+    expect(build.status).toBe(403)
+    expect(build.error?.code).toBe('forbidden')
   })
 
   it('skips a symlink row while walking a directory (no escape by following)', async () => {

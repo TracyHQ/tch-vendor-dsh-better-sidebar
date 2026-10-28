@@ -7,13 +7,16 @@
  * web runtime's `trustedHosts` (LAN IP literals sampled at boot plus
  * `--trusted-host` authorities), read per request from the live service
  * value so the fence tracks the same trust source the /api gateway derives
- * its list from.
+ * its list from — AND the host Connection's authenticated admission check
+ * (`ctx.connection.requestRejection`: launch-token signed cookie).
  *
  * All operations are conversation-scoped: requests carry a sessionId and the
- * session's authoritative cwd comes from the session store.
+ * session's authoritative cwd comes from the session store (never from the
+ * request); unknown sessions are refused, and every filesystem target is
+ * confined to that workspace (path-security.ts).
  */
 import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { basename, dirname, extname, isAbsolute, join, sep } from 'node:path'
+import { basename, dirname, extname, isAbsolute, join, posix, sep } from 'node:path'
 import type { IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { WebSocket, WebSocketServer } from 'ws'
@@ -28,10 +31,10 @@ import {
   type SidebarConfig,
   type SidebarPrefs,
 } from './config.ts'
-import { invalidateDirectoryCache, listDirectory, messageOf, parentOf, requireAbsolute, rootLabel, type SidebarFsEntry } from './fs-tree.ts'
+import { invalidateDirectoryCache, listDirectory, messageOf, parentOf, requireAbsolute, respellListing, rootLabel, type SidebarFsEntry } from './fs-tree.ts'
 import { resolveSessionPath } from './session-path.ts'
 import { mkdirWorkspaceEntry, renameWorkspaceEntry, removeWorkspaceEntry, writeWorkspaceUpload } from './fs-operations.ts'
-import { ensureWorkspacePath, ensureWorkspaceWritePath } from './path-security.ts'
+import { ensureWorkspacePath, ensureWorkspaceWritePath, realWorkspace, type WorkspacePath } from './path-security.ts'
 import { searchFiles } from './fs-search.ts'
 import { decodeHtmlUrl } from './html-route.ts'
 import { isTrustedApiRequest } from './trust-fence.ts'
@@ -87,8 +90,8 @@ export interface SidebarFsLevel {
   error?: string
 }
 
-/** Services required before mounting: the webserver routes, the session store, the web runtime's trusted hosts, and the tool registry. */
-export const inject = ['webServer', 'sessions', 'webRuntime', 'tools']
+/** Services required before mounting: the webserver routes, the session store, the web runtime's trusted hosts, the tool registry, and the host Connection (authenticated route admission). */
+export const inject = ['webServer', 'sessions', 'webRuntime', 'tools', 'connection']
 
 /** Content types for the media route, by extension. */
 const MEDIA_TYPES: Record<string, string> = {
@@ -112,35 +115,25 @@ export function mediaTypeForPath(path: string): string {
 }
 
 /**
- * Resolve a session's authoritative working directory. The attached session
- * header wins; while the session is still hydrating from persistence (the
- * web client attaches the current conversation a moment after page load, so
- * the very first sidebar requests can arrive detached) the caller's own
- * list-summary cwd is used; the session-persistence index is queried as a
- * last resort for cold (not-yet-attached) sessions so a detached first
- * request still resolves the correct project instead of the host process
- * cwd (which on Windows is the DSH source root after `dsh.cmd`'s `pushd`,
- * causing every user-project path to be misclassified as "outside
- * workspace"). The host process cwd is the FINAL fallback for deployments
- * without persistence (tests / stripped-down hosts); production always
- * provides persistence, so the bug-fix path (header → client → persistence)
- * always resolves the real session cwd before reaching it.
+ * Resolve a session's authoritative working directory from the server's own
+ * record: the attached session's header, or — for a cold (not-yet-attached)
+ * session, e.g. the first sidebar requests right after page load — the
+ * session-persistence index. A caller-supplied cwd is never consulted, and a
+ * session the host does not know is refused: the cwd is the containment root
+ * of every filesystem route (see path-security.ts).
  */
-async function sessionCwdOf(ctx: Context, sessionId: string, clientCwd?: string): Promise<string> {
+async function sessionCwdOf(ctx: Context, sessionId: string): Promise<string> {
   const session = ctx.sessions.get(sessionId)
   const headerCwd = session?.header.cwd
   if (headerCwd !== undefined && headerCwd !== '') return headerCwd
-  if (clientCwd !== undefined && clientCwd !== '') {
-    try {
-      return requireAbsolute(clientCwd)
-    } catch {
-      throw new SidebarError('bad-request', `invalid working directory "${clientCwd}"`)
-    }
-  }
   const persistence = ctx.get('sessionPersistence')
   if (persistence !== undefined) {
-    const persisted = await readPersistedSession(persistence, sessionId)
-    const metaCwd = persisted.header.cwd
+    let metaCwd: string | undefined
+    try {
+      metaCwd = (await readPersistedSession(persistence, sessionId)).header.cwd
+    } catch {
+      metaCwd = undefined
+    }
     if (metaCwd !== undefined && metaCwd !== '') {
       try {
         return requireAbsolute(metaCwd)
@@ -149,7 +142,7 @@ async function sessionCwdOf(ctx: Context, sessionId: string, clientCwd?: string)
       }
     }
   }
-  return process.cwd()
+  throw new SidebarError('not-found', `unknown session "${sessionId}"`, 404)
 }
 
 /** Optional repository selected by the Git panel when cwd is a container. */
@@ -176,6 +169,40 @@ async function resolveGitPath(cwd: string, raw: string, selected?: string): Prom
   if (await stat(sessionPath).then(() => true).catch(() => false)) return sessionPath
   const root = await git.repoRoot(cwd, selected).catch(() => cwd)
   return requireAbsolute(join(root, raw))
+}
+
+/**
+ * Resolve a git-route path (absolute, session-relative, or repository-root-
+ * relative as git status reports it) and confine it to the REPOSITORY ROOT.
+ * Git actions cover the whole repository, even when the session cwd is a
+ * subdirectory of it (owner decision); what is refused is anything leaving
+ * the repository (`..` past its root, an absolute path elsewhere, a symlink
+ * pointing out). Uses the write-path check (realpath of the nearest existing
+ * ancestor, canonical root) because a git path may name a file deleted from
+ * the worktree.
+ * @returns the canonical (checked) absolute path to hand to git.
+ * @throws SidebarError `forbidden` (403) outside the repository.
+ */
+async function containedGitPath(cwd: string, raw: string, selected?: string): Promise<string> {
+  const root = await git.repoRoot(cwd, selected)
+  return (await ensureWorkspaceWritePath(root, await resolveGitPath(cwd, raw, selected))).real
+}
+
+/**
+ * Confine a revision-tree path (`git show <rev>:<path>`, repository-relative)
+ * to the repository: the path is normalized, must not climb above the
+ * repository root, and its worktree location (through realpath, so a symlink
+ * pointing out is refused) must lie inside the repository root.
+ * @returns the normalized repository-relative path to hand to git.
+ */
+async function containedRevisionPath(cwd: string, raw: string, selected?: string): Promise<string> {
+  const normalized = posix.normalize(raw.replace(/\\/g, '/'))
+  if (normalized === '..' || normalized.startsWith('../') || posix.isAbsolute(normalized) || isAbsolute(raw)) {
+    throw new SidebarError('forbidden', `path "${raw}" is outside the repository`, 403)
+  }
+  const root = await git.repoRoot(cwd, selected)
+  await ensureWorkspaceWritePath(root, requireAbsolute(join(root, normalized)))
+  return normalized
 }
 
 /** How many leading bytes a binary read returns for client-side detect sniffing. */
@@ -256,9 +283,7 @@ function buildApi(
 ): Record<string, ApiMethod> {
   const cwdOf = async (payload: unknown): Promise<{ sessionId: string; cwd: string }> => {
     const sessionId = requireString(payload, 'sessionId')
-    const record = payload as { cwd?: unknown } | null
-    const clientCwd = typeof record?.cwd === 'string' && record.cwd !== '' ? record.cwd : undefined
-    return { sessionId, cwd: await sessionCwdOf(ctx, sessionId, clientCwd) }
+    return { sessionId, cwd: await sessionCwdOf(ctx, sessionId) }
   }
   /** Resolve the optional Git-panel checkout selector against the authoritative
    * session repository. Unlike `cwd`, `worktree` is never trusted directly. */
@@ -291,8 +316,10 @@ function buildApi(
     'fs.tree': async (payload) => {
       const { cwd } = await cwdOf(payload)
       const record = payload as { path?: unknown }
-      const target = record.path === undefined ? cwd : await ensureWorkspacePath(cwd, requireString(payload, 'path'))
-      return listDirectory(target, resolved.listLimit)
+      // Listed (and cached) at the canonical path; answered in the caller's spelling.
+      // Symlink rows are only followed inside the workspace root.
+      const target = await ensureWorkspacePath(cwd, record.path === undefined ? cwd : requireString(payload, 'path'))
+      return respellListing(await listDirectory(target.real, resolved.listLimit, await realWorkspace(cwd)), target.display)
     },
     // Batch listing: one request for every level the tree has expanded, so a
     // mount/refresh costs one round trip instead of N. Each path rides the
@@ -309,12 +336,19 @@ function buildApi(
       if (paths.length > FS_TREES_MAX_PATHS) {
         throw new SidebarError('bad-request', `too many paths (max ${FS_TREES_MAX_PATHS})`)
       }
+      // The root for the outside-symlink rule. A cwd that no longer resolves
+      // must not fail the batch: each level then reports its own error (the
+      // per-level ensureWorkspacePath below fails on the same cwd), exactly
+      // like any other unreadable level.
+      const root = await realWorkspace(cwd).catch(() => undefined)
       const levels = await Promise.all(paths.map(async (raw): Promise<SidebarFsLevel> => {
         // A session-relative path is accepted here (the tree already carries
         // cwd-relative paths); `fs.tree` itself keeps requiring absolute input.
         const requested = isAbsolute(raw) ? raw : `${cwd}${sep}${raw}`
         try {
-          return await listDirectory(await ensureWorkspacePath(cwd, requested), resolved.listLimit)
+          const target = await ensureWorkspacePath(cwd, requested)
+          if (root === undefined) throw new SidebarError('fs-error', `cannot resolve workspace "${cwd}"`, 400)
+          return respellListing(await listDirectory(target.real, resolved.listLimit, root), target.display)
         } catch (error) {
           // Per-level failure: the batch itself stays a success (one unreadable
           // directory must not blank the whole tree).
@@ -338,25 +372,26 @@ function buildApi(
       // child-repo path is relative to the selected repoRoot, not the session
       // cwd; thread it so the path resolves inside the authorized workspace.
       const selected = selectedRepoOf(payload)
-      const path = await ensureWorkspacePath(cwd, await resolveGitPath(cwd, requireString(payload, 'path'), selected))
-      const { content, truncated, binary, size, head } = await readText(path, resolved.readLimit)
+      const { real } = await ensureWorkspacePath(cwd, await resolveGitPath(cwd, requireString(payload, 'path'), selected))
+      const { content, truncated, binary, size, head } = await readText(real, resolved.readLimit)
       if (binary) return { kind: 'binary', size, truncated, head }
       return { kind: 'text', content, truncated }
     },
     'fs.write': async (payload) => {
       const { cwd } = await cwdOf(payload)
-      const path = await ensureWorkspaceWritePath(cwd, requireString(payload, 'path'))
+      // Written at the canonical destination the containment check approved.
+      const { real, display } = await ensureWorkspaceWritePath(cwd, requireString(payload, 'path'))
       const content = requireString(payload, 'content')
-      const tmp = `${path}.dsh-sidebar-tmp-${process.pid}`
+      const tmp = `${real}.dsh-sidebar-tmp-${process.pid}`
       try {
-        await mkdir(dirname(path), { recursive: true })
+        await mkdir(dirname(real), { recursive: true })
         await writeFile(tmp, content, 'utf8')
-        await rename(tmp, path)
+        await rename(tmp, real)
       } catch (error) {
         await rm(tmp, { force: true }).catch(() => {})
-        throw new SidebarError('fs-error', `cannot write "${path}": ${error instanceof Error ? error.message : String(error)}`, 400)
+        throw new SidebarError('fs-error', `cannot write "${display}": ${error instanceof Error ? error.message : String(error)}`, 400)
       }
-      invalidateDirectoryCache(dirname(path))
+      invalidateDirectoryCache(dirname(real))
       return { ok: true }
     },
     // The tree row's rename: single-segment name, destination-existence and
@@ -406,21 +441,23 @@ function buildApi(
       const { cwd } = await gitCwdOf(payload)
       const record = payload as { path?: unknown; staged?: unknown }
       const repoRoot = selectedRepoOf(payload)
-      const path = record.path === undefined ? undefined : await resolveGitPath(cwd, requireString(payload, 'path'), repoRoot)
+      const path = record.path === undefined ? undefined : await containedGitPath(cwd, requireString(payload, 'path'), repoRoot)
       return { diff: await git.diff(cwd, path, record.staged === true, repoRoot) }
     },
     'git.stage': async (payload) => {
       const { cwd } = await gitCwdOf(payload)
       const record = payload as { path?: unknown }
-      const path = record.path === undefined ? undefined : requireString(payload, 'path')
-      await git.stage(cwd, path, selectedRepoOf(payload))
+      const repoRoot = selectedRepoOf(payload)
+      const path = record.path === undefined ? undefined : await containedGitPath(cwd, requireString(payload, 'path'), repoRoot)
+      await git.stage(cwd, path, repoRoot)
       return { ok: true }
     },
     'git.unstage': async (payload) => {
       const { cwd } = await gitCwdOf(payload)
       const record = payload as { path?: unknown }
-      const path = record.path === undefined ? undefined : requireString(payload, 'path')
-      await git.unstage(cwd, path, selectedRepoOf(payload))
+      const repoRoot = selectedRepoOf(payload)
+      const path = record.path === undefined ? undefined : await containedGitPath(cwd, requireString(payload, 'path'), repoRoot)
+      await git.unstage(cwd, path, repoRoot)
       return { ok: true }
     },
     'git.commit': async (payload) => {
@@ -456,7 +493,7 @@ function buildApi(
     'git.discard': async (payload) => {
       const { cwd } = await gitCwdOf(payload)
       const repoRoot = selectedRepoOf(payload)
-      await git.discard(cwd, await resolveGitPath(cwd, requireString(payload, 'path'), repoRoot), repoRoot)
+      await git.discard(cwd, await containedGitPath(cwd, requireString(payload, 'path'), repoRoot), repoRoot)
       return { ok: true }
     },
     'git.revert': async (payload) => {
@@ -477,8 +514,9 @@ function buildApi(
       // the a// b/ prefix). The absolute filesystem paths resolveGitPath
       // produces would break the rev:path syntax and fail every read, so the
       // path passes through as-is — it can only address blobs of this repo's
-      // own revisions, the same surface git.diff/git.log already expose.
-      const path = requireString(payload, 'path')
+      // own revisions. It is still confined: its worktree location must lie
+      // inside the session workspace (containedRevisionPath).
+      const path = await containedRevisionPath(cwd, requireString(payload, 'path'), repoRoot)
       const rev = requireString(payload, 'rev')
       return { content: await git.show(cwd, rev, path, repoRoot) }
     },
@@ -568,10 +606,16 @@ function buildApi(
     // client is a browser renderer where raw scheme navigation is
     // unreliable, so the launch always goes through the host — the same
     // fence as every other route, argv-only (no shell interpolation).
-    'open.external': (payload) => {
+    'open.external': async (payload) => {
       const record = payload as { action?: unknown } | null
       const action = record?.action
-      if (action === 'reveal') return launchExternal('reveal', requireString(payload, 'path'))
+      if (action === 'reveal') {
+        // Session-scoped like fs.read: the path must lie inside the session
+        // workspace, and the opener gets the canonical path that was checked.
+        const { cwd } = await cwdOf(payload)
+        const { real } = await ensureWorkspacePath(cwd, requireString(payload, 'path'))
+        return launchExternal('reveal', real)
+      }
       if (action === 'url') return launchExternal('url', requireString(payload, 'url'))
       throw new SidebarError('bad-request', 'action must be "reveal" or "url"')
     },
@@ -587,14 +631,18 @@ function buildApi(
         : []
       if (paths.length === 0) throw new SidebarError('bad-request', 'paths must be a non-empty array')
       const name = archiveNameOf(typeof record?.name === 'string' ? record.name : null)
-      const selected: string[] = []
+      const selected: WorkspacePath[] = []
       for (const raw of paths) selected.push(await ensureWorkspacePath(cwd, raw))
       // Same-basename selections (a/index.ts + b/index.ts) get parent segments
-      // prepended, so no two archive members collide.
+      // prepended, so no two archive members collide. Member names follow the
+      // caller's spelling; the walk reads the canonical paths.
       const entries: ZipEntry[] = []
-      const names = disambiguateArchiveNames(selected)
-      for (const [index, absolute] of selected.entries()) {
-        await collectZipEntries(absolute, names[index]!, entries)
+      const names = disambiguateArchiveNames(selected.map(path => path.display))
+      // The build reads in the background: every file entry carries the
+      // canonical workspace root so it is re-checked at read time.
+      const root = await realWorkspace(cwd)
+      for (const [index, path] of selected.entries()) {
+        await collectZipEntries(path.real, names[index]!, entries, undefined, root)
       }
       return archiveTasks.start({ sessionId, name, entries })
     },
@@ -764,7 +812,18 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
   // plus --trusted-host authorities) — the authoritative source the /api
   // gateway fence derives its list from. Read per request from the live
   // service value; a replaced list takes effect without a plugin restart.
-  const fence = (req: SidebarHttpRequest): boolean => isTrustedApiRequest(req, ctx.webRuntime.trustedHosts)
+  // Admission for every /sidebar HTTP and WebSocket route: the plugin's own
+  // Host/Origin fence (kept as an extra layer), then the host Connection's
+  // authenticated check — the same Host/Origin rules plus the launch-token
+  // signed browser cookie the /api gateway requires. Fails closed (401) when
+  // the host provides no such check.
+  const rejectionOf = (req: SidebarHttpRequest): 401 | 403 | undefined => {
+    if (!isTrustedApiRequest(req, ctx.webRuntime.trustedHosts)) return 403
+    const connection = ctx.connection
+    if (connection?.requestRejection === undefined) return 401
+    return connection.requestRejection(req)
+  }
+  const fence = (req: SidebarHttpRequest): boolean => rejectionOf(req) === undefined
   // The model-facing open-request registry: queues `sidebar_open` requests
   // per session and pushes them to connected sidebar views over the
   // `/sidebar/ws/agent-opens` socket.
@@ -896,8 +955,9 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
     kind: 'prefix',
     path: '/sidebar/api',
     handler: async (req, res) => {
-      if (!fence(req)) {
-        writeJson(res, 403, { ok: false, error: { code: 'forbidden', message: 'forbidden' } })
+      const rejection = rejectionOf(req)
+      if (rejection !== undefined) {
+        writeJson(res, rejection, { ok: false, error: { code: 'forbidden', message: 'forbidden' } })
         return
       }
       if (req.method !== 'POST') {
@@ -933,8 +993,9 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
     kind: 'exact',
     path: '/sidebar/upload',
     handler: async (req, res) => {
-      if (!fence(req)) {
-        writeJson(res, 403, { ok: false, error: { code: 'forbidden', message: 'forbidden' } })
+      const rejection = rejectionOf(req)
+      if (rejection !== undefined) {
+        writeJson(res, rejection, { ok: false, error: { code: 'forbidden', message: 'forbidden' } })
         return
       }
       if (req.method !== 'POST') {
@@ -949,7 +1010,7 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
         if (sessionId === null || dir === null || relativePath === null || relativePath.trim() === '') {
           throw new SidebarError('bad-request', 'sessionId, dir, and relativePath are required')
         }
-        const cwd = await sessionCwdOf(ctx, sessionId, url.searchParams.get('cwd') ?? undefined)
+        const cwd = await sessionCwdOf(ctx, sessionId)
         const { path, size } = await writeWorkspaceUpload({
           cwd,
           dir,
@@ -982,8 +1043,9 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
     kind: 'exact',
     path: '/sidebar/archive',
     handler: async (req, res) => {
-      if (!fence(req)) {
-        writeJson(res, 403, { ok: false, error: { code: 'forbidden', message: 'forbidden' } })
+      const rejection = rejectionOf(req)
+      if (rejection !== undefined) {
+        writeJson(res, rejection, { ok: false, error: { code: 'forbidden', message: 'forbidden' } })
         return
       }
       if (req.method !== 'GET') {
@@ -1007,8 +1069,9 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
     kind: 'prefix',
     path: '/sidebar/file',
     handler: async (req, res) => {
-      if (!fence(req)) {
-        res.writeHead(403)
+      const rejection = rejectionOf(req)
+      if (rejection !== undefined) {
+        res.writeHead(rejection)
         res.end('forbidden')
         return
       }
@@ -1022,14 +1085,16 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
         const sessionId = url.searchParams.get('sessionId')
         const raw = url.searchParams.get('path')
         if (sessionId === null || raw === null) throw new SidebarError('bad-request', 'sessionId and path are required')
-        const cwd = await sessionCwdOf(ctx, sessionId, url.searchParams.get('cwd') ?? undefined)
-        const path = await ensureWorkspacePath(cwd, raw)
-        const info = await stat(path)
+        const cwd = await sessionCwdOf(ctx, sessionId)
+        // Read at the canonical path; type and download name follow the
+        // caller's spelling (the name the user asked for).
+        const { real, display: path } = await ensureWorkspacePath(cwd, raw)
+        const info = await stat(real)
         if (!info.isFile() || info.size > resolved.mediaLimit) {
           throw new SidebarError('fs-error', 'not a file or too large', 400)
         }
         const type = mediaTypeForPath(path)
-        const body = await readFile(path)
+        const body = await readFile(real)
         // Raw bytes either way (binary-safe); ?download=1 switches the
         // disposition so the browser saves the file instead of showing it.
         const headers: Record<string, string> = { 'content-type': type, 'cache-control': 'no-cache' }
@@ -1059,8 +1124,9 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
     kind: 'prefix',
     path: '/sidebar/html',
     handler: async (req, res) => {
-      if (!fence(req)) {
-        res.writeHead(403)
+      const rejection = rejectionOf(req)
+      if (rejection !== undefined) {
+        res.writeHead(rejection)
         res.end('forbidden')
         return
       }
@@ -1077,19 +1143,16 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
           return
         }
         const { sessionId, path } = decoded.ref
-        // The session's authoritative cwd (client cwd cannot ride in the URL
-        // — the path encoding has no query; a detached first request falls
-        // back to the process cwd and is normally refused by the workspace
-        // real-path guard, with the same semantics as the media route's
-        // fallback.
+        // The session's authoritative cwd (the server's record; an unknown
+        // session is refused), and the decoded path is confined to it.
         const cwd = await sessionCwdOf(ctx, sessionId)
-        const absolute = await ensureWorkspacePath(cwd, path)
-        const info = await stat(absolute)
+        const { real, display } = await ensureWorkspacePath(cwd, path)
+        const info = await stat(real)
         if (!info.isFile() || info.size > resolved.mediaLimit) {
           throw new SidebarError('fs-error', 'not a file or too large', 400)
         }
-        const type = mediaTypeForPath(absolute)
-        const body = await readFile(absolute)
+        const type = mediaTypeForPath(display)
+        const body = await readFile(real)
         res.writeHead(200, {
           'content-type': type === 'text/html' ? 'text/html; charset=utf-8' : type,
           'cache-control': 'no-cache',
@@ -1133,7 +1196,7 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
   // reader's expanded-folder set; the host watches exactly those directories
   // and pushes a debounced notice per change, so the tree re-lists in place.
   // Paths are resolved exactly like `fs.tree`'s (same resolution, same
-  // lexical rules), so the watch observes what the tree can list.
+  // containment), so the watch observes what the tree can list.
   const fsWatchWss = new WebSocketServer({ noServer: true })
   ctx.effect(() => ctx.webServer.registerUpgrade({
     path: '/sidebar/ws/fs-watch',
@@ -1230,13 +1293,17 @@ async function handleFsWatchFrame(
   if (path === undefined || path === '') return
   try {
     const cwd = await sessionCwdOf(ctx, sessionId)
-    const dir = await ensureWorkspacePath(cwd, path)
     if (frame.op === 'unwatch') {
-      watchers.remove(dir)
+      // Releasing a handle touches no file: keyed by the caller's spelling,
+      // with no realpath (the directory may already be gone).
+      watchers.remove(requireAbsolute(resolveSessionPath(cwd, path)))
       return
     }
     if (frame.op !== 'watch') return
-    const ok = watchers.add(dir)
+    // Keyed and reported in the caller's spelling; the OS watcher (and the
+    // listing-cache invalidation) uses the canonical directory.
+    const { real, display: dir } = await ensureWorkspacePath(cwd, path)
+    const ok = watchers.add(dir, real)
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ dir, ok }))
   } catch (error) {
     // The tree keeps working without live refresh; a refused path is reported

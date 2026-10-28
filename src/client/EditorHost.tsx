@@ -232,7 +232,7 @@ export function EditorHost(props: {
     const target = openWithTargets.find(item => item.id === targetId)
     if (target === undefined) return
     if (target.kind === 'reveal') {
-      void api.openExternal({ action: 'reveal', path: absolute }).catch(
+      void api.openExternal({ action: 'reveal', path: absolute, sessionId: scope.sessionId }).catch(
         (error: unknown) => { console.error('open external failed', error) },
       )
       return

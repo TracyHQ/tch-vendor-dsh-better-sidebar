@@ -736,11 +736,14 @@ test('standard WCO geometry drives the strip reactively (issue #257)', async ({ 
   await expect(page.locator('body[data-dsh-title-bar-compat]')).toBeAttached()
 })
 
-test('opt-in shell preset applies its strip when WCO is absent (data-driven, manual)', async ({ request, page }) => {
+test('opt-in shell preset applies its strip when WCO is absent (data-driven, manual)', async ({ page }) => {
+  // /sidebar/* routes sit behind the host's cookie auth, so the settings
+  // writes go through the authenticated `api` context, not the bare
+  // `request` fixture (which carries no cookie and is refused with 401).
   // The anywhere-labs DSH Desktop preset (shell-presets.ts) is OPT-IN: under
   // the preset scheme the win32 advanced stamp resolves to its 32px fallback
   // even without the WCO API; auto never does this.
-  const update = await request.post(sidebarApi('settings.update'), {
+  const update = await api.post(sidebarApi('settings.update'), {
     data: { patch: { titleBarScheme: 'preset', titleBarPresetId: 'dsh-desktop', titleBarCompat: true } },
   })
   expect(update.ok(), `settings.update: ${update.status()}`).toBe(true)
@@ -758,14 +761,14 @@ test('opt-in shell preset applies its strip when WCO is absent (data-driven, man
     await expect(page.locator('style[data-dsh-preset-css]')).toHaveCount(0)
   } finally {
     // Restore the shared server state for the lanes after this one.
-    await request.post(sidebarApi('settings.update'), {
+    await api.post(sidebarApi('settings.update'), {
       data: { patch: { titleBarScheme: 'auto', titleBarPresetId: '', customCss: '', titleBarCompat: false } },
     })
   }
 })
 
-test('custom scheme injects the user stylesheet live', async ({ request, page }) => {
-  const update = await request.post(sidebarApi('settings.update'), {
+test('custom scheme injects the user stylesheet live', async ({ page }) => {
+  const update = await api.post(sidebarApi('settings.update'), {
     data: { patch: { titleBarScheme: 'custom', customCss: 'html { --dsh-e2e-marker: 1; }', titleBarCompat: true } },
   })
   expect(update.ok(), `settings.update: ${update.status()}`).toBe(true)
@@ -777,7 +780,7 @@ test('custom scheme injects the user stylesheet live', async ({ request, page })
     const marker = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--dsh-e2e-marker').trim())
     expect(marker).toBe('1')
   } finally {
-    await request.post(sidebarApi('settings.update'), {
+    await api.post(sidebarApi('settings.update'), {
       data: { patch: { titleBarScheme: 'auto', titleBarPresetId: '', customCss: '', titleBarCompat: false } },
     })
   }

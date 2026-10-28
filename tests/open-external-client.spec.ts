@@ -73,7 +73,7 @@ describe('api.openExternal', () => {
     vi.stubGlobal('window', { location: { assign } })
     vi.stubGlobal('fetch', fetchMock)
 
-    await api.openExternal({ action: 'reveal', path: '/tmp/a.ts' })
+    await api.openExternal({ action: 'reveal', path: '/tmp/a.ts', sessionId: 's1' })
     await api.openExternal({
       action: 'url',
       url: 'https://vscode-remote/ssh-remote+dev/home/u/f.ts',
@@ -81,6 +81,8 @@ describe('api.openExternal', () => {
 
     expect(assign).not.toHaveBeenCalled()
     expect(fetchMock).toHaveBeenCalledTimes(2)
+    // The reveal carries its session so the host can confine it to the workspace.
+    expect(JSON.parse(String((fetchMock.mock.calls[0]?.[1] as { body?: unknown } | undefined)?.body))).toMatchObject({ action: 'reveal', sessionId: 's1' })
   })
 
   it('returns a rejected promise when client navigation throws', async () => {

@@ -234,7 +234,8 @@ function gitPayload(scope: SessionScope, worktree: string | undefined, extra: Re
 
 /** One external-open request from the file tree. */
 type OpenExternalPayload =
-  | { action: 'reveal'; path: string }
+  /** `sessionId` scopes the reveal: the host confines it to that session's workspace. */
+  | { action: 'reveal'; path: string; sessionId: string }
   | { action: 'url'; url: string }
 
 /** The host route's success shape. */

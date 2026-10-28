@@ -975,8 +975,8 @@ export function GitLens(props: GitLensProps) {
           setFileMenu(null)
           if (id === 'open') {
             const resolved = resolveSidebarPath(repoRoot ?? selectedWorktree ?? scope.cwd, target.path)
-            // The host accepts any path now (no containment), so the open
-            // guard that mirrored the old fence is gone with it.
+            // The host confines reads to the session workspace; a repo file
+            // above a nested session cwd opens as the host's 403 error.
             onOpenFile(resolved)
             return
           }
